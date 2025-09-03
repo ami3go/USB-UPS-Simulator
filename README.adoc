@@ -1,5 +1,9 @@
 = HID UPS Power Device Library for Arduino =
 
+
+https://projecthub.arduino.cc/abratchik/hid-compliant-ups-with-arduino-3e597a
+
+
 This library allows an Arduino board with USB capabilities to act as a HID-compliant UPS according to USB HID specifications. 
 The library is useful if you want to build a smart UPS or other power device, which can report its state to the PC host
 or perform power on/power off operations as necessary for your project.
