@@ -69,7 +69,10 @@ class SocketLineTransport:
             if newline >= 0:
                 raw = bytes(self._rx[:newline])
                 del self._rx[: newline + 1]
-                return raw.rstrip(b"\r").decode("ascii", errors="strict")
+                try:
+                    return raw.rstrip(b"\r").decode("ascii", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise ProtocolError("simulator returned non-ASCII data") from exc
             try:
                 chunk = self._sock.recv(256)
             except socket.timeout as exc:
@@ -85,6 +88,12 @@ class SocketLineTransport:
             return
         deadline = time.monotonic() + window
         while True:
+            # One recv() can contain both firmware greeting lines. Always
+            # consume complete lines already buffered before waiting on select().
+            if b"\n" in self._rx:
+                self.greeting.append(self._readline())
+                continue
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -101,7 +110,7 @@ class SocketLineTransport:
             raise ValueError("command must be a single line")
         try:
             self._sock.sendall(command.encode("ascii") + b"\n")
-        except OSError as exc:
+        except (OSError, UnicodeEncodeError) as exc:
             raise TransportError(f"socket send failed: {exc}") from exc
         return self._readline()
 
@@ -274,7 +283,9 @@ class UpsSimulator:
         self.close()
 
     def raw_command(self, command: str) -> str:
-        """Send one protocol command and return the payload after OK."""
+        """Send one single-response protocol command and return its OK payload."""
+        if command.strip().upper() in {"HELP", "?"}:
+            raise ValueError("HELP is multi-line and is not supported by raw_command()")
         return _strip_ok(self.transport.command(command))
 
     def ping(self) -> bool:
