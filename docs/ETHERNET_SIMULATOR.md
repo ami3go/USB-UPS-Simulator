@@ -27,6 +27,12 @@ Common W5500 Arduino shields use:
 
 The simulator therefore does not use D4 or D10 for status/control GPIO. D4 is driven HIGH to keep the unused SD card interface de-selected.
 
+### Powering for full-cycle shutdown tests
+
+For tests that intentionally shut down the USB host, power the Leonardo independently through its normal external-power input so that the simulator and Ethernet control path remain alive after the host turns off. The Leonardo automatically selects between USB and external power.
+
+This allows a controller to simulate power restoration after the Nut-ups server has shut down. Use a supply within the Leonardo input limits; the Arduino documentation recommends 7-12 V for the barrel-jack/VIN path.
+
 ## Network
 
 The firmware first attempts DHCP.
@@ -195,3 +201,14 @@ Cockpit / test tool --------------------+
 The Nut-ups host should consume the USB HID UPS normally. The management side should use the Ethernet control port only to inject simulated conditions.
 
 Do not expose TCP port 5000 to an untrusted network. The current protocol intentionally has no authentication; the `ARM` mechanism protects against accidental state changes, not hostile access.
+
+## Leonardo resource use
+
+The GitHub Actions compile check uses Arduino AVR core 1.8.8 and Ethernet library 2.0.2.
+
+Current build results:
+
+- original UPS example: 9,818 / 28,672 bytes flash (34%), 302 / 2,560 bytes static RAM (11%)
+- Ethernet simulator: 27,678 / 28,672 bytes flash (96%), 1,246 / 2,560 bytes static RAM (48%)
+
+The Leonardo build therefore fits and is usable, but flash headroom is small. Keep the Leonardo implementation intentionally compact. A future port to a native-USB MCU with more flash/RAM would be preferable if the simulator grows substantially (web UI, authentication, scenario storage, TLS, or richer automation).
