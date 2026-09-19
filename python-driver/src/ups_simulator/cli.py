@@ -4,7 +4,7 @@ import argparse
 from dataclasses import asdict
 import json
 import sys
-from typing import Sequence
+from typing import Optional, Sequence
 
 from .driver import SimulatorError, UpsSimulator
 
@@ -62,7 +62,7 @@ def _make_client(args: argparse.Namespace) -> UpsSimulator:
     return UpsSimulator.serial(args.serial_port, baudrate=args.baud, timeout=args.timeout)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
