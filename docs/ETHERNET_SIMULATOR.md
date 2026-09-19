@@ -1,76 +1,137 @@
 # Ethernet-controlled USB HID UPS simulator
 
-This example turns an Arduino Leonardo-class ATmega32U4 board into a USB HID UPS while a W5500 Ethernet shield provides a separate control channel.
+The `examples/UPS_Simulator_Ethernet` firmware turns an Arduino Leonardo-class ATmega32U4 board into a remotely controlled USB HID UPS. A W5500 Ethernet shield provides the primary control channel while `Serial1` provides a UART fallback.
 
-## Intended use
+For installation instructions start with [FLASHING.md](FLASHING.md). For the complete command table use [CONTROL_PROTOCOL.md](CONTROL_PROTOCOL.md).
 
-The USB port is connected to the system under test. That system sees a HID Power Device / UPS.
+## Architecture
 
-The Ethernet interface is connected to the management or test network. A test controller, Cockpit plugin, or terminal client can change the simulated UPS state without touching the USB link.
+```text
+                     control / test LAN
+Cockpit / Python / nc -------- TCP 5000
+                              |
+                              v
+                        +-----------+
+                        |   W5500   |
+                        +-----+-----+
+                              | SPI/ICSP
+                        +-----+-----+
+                        | Leonardo  |
+                        +--+-----+--+
+                           |     |
+                     USB HID   Serial1
+                           |     115200
+                           v
+                     NUT host under test
+```
 
-A hardware UART control channel is also available on `Serial1` at 115200 baud for bench use.
+The USB interface remains the UPS-facing connection. Ethernet/UART are only used to inject simulated conditions.
 
 ## Hardware
 
-- Arduino Leonardo or compatible ATmega32U4 board supported by this library
-- Arduino Ethernet Shield 2 or compatible W5500 shield/module
-- USB cable to the host under test
+Reference hardware:
+
+- Arduino Leonardo or compatible ATmega32U4 native-USB board
+- W5500 Arduino Ethernet shield
+- shield must have the 2x3 ICSP socket populated for Leonardo SPI
+- USB data cable to the system under test
 - Ethernet cable to the control network
 
-### Pin use
+Standard shield pin use:
 
-Common W5500 Arduino shields use:
+- ICSP: MOSI/MISO/SCK
+- D10: W5500 chip select
+- D4: microSD chip select; firmware holds it HIGH while SD is unused
+- D0/D1: optional hardware UART (`Serial1`)
 
-- D10: Ethernet chip select
-- D4: microSD chip select
-- ICSP header: SPI bus on Leonardo
+See [HARDWARE.md](HARDWARE.md) for wiring and powering details.
 
-The simulator therefore does not use D4 or D10 for status/control GPIO. D4 is driven HIGH to keep the unused SD card interface de-selected.
+## Powering for full shutdown tests
 
-### Powering for full-cycle shutdown tests
+If the simulated UPS causes the USB host to shut down, the controller must remain alive so it can later simulate restored power.
 
-For tests that intentionally shut down the USB host, power the Leonardo independently through its normal external-power input so that the simulator and Ethernet control path remain alive after the host turns off. The Leonardo automatically selects between USB and external power.
+Therefore, for full-cycle tests, power the Leonardo independently through a supported external-power input while keeping its USB cable connected to the NUT host.
 
-This allows a controller to simulate power restoration after the Nut-ups server has shut down. Use a supply within the Leonardo input limits; the Arduino documentation recommends 7-12 V for the barrel-jack/VIN path.
+Do not assume every clone implements power selection identically; verify the exact board specification before applying external and USB power simultaneously.
 
-## Network
+## Network behavior
 
 The firmware first attempts DHCP.
 
-If DHCP fails it uses:
+If DHCP fails it falls back to:
 
-- IP: `169.254.42.42`
-- subnet: `255.255.0.0`
-- TCP control port: `5000`
+```text
+IP:      169.254.42.42
+Subnet:  255.255.0.0
+TCP:     5000
+```
 
-The MAC address in the example is locally administered. Change the final bytes if more than one simulator is placed on the same LAN.
+Default locally administered MAC:
+
+```text
+02:55:50:53:00:01
+```
+
+Give each simulator a unique MAC address if multiple boards share one LAN.
 
 ## Safety model
 
-The simulator boots in a safe state:
+The simulator starts:
 
-- disarmed
-- AC present
-- battery 100%
-- no low-battery, overload, replacement, communication-loss, or shutdown flags
+```text
+DISARMED
+AC present
+battery 100%
+load 25%
+input 230 V
+output 230 V
+fault flags cleared
+```
 
-State-changing commands are rejected until:
+Read-only queries work while disarmed. State-changing commands require:
 
 ```text
 ARM ON
 ```
 
-`ARM OFF` or `RESET` immediately restores the safe online state and disarms the simulator.
+Either:
 
-This is intentional because a simulated `OB`/low-battery condition can cause the NUT system under test to shut down real machines.
+```text
+RESET
+```
 
-## Control protocol
+or:
 
-The control protocol is line-oriented ASCII over TCP port 5000 or hardware UART.
+```text
+ARM OFF
+```
 
-Commands are case-insensitive and terminated by LF (`\n`). CRLF is also accepted.
+returns the simulator to the safe online state and disarms it.
 
-### Read-only commands
+This behavior is deliberate because NUT can react to the generated `OB`, `LB`, overload, and shutdown-imminent states by shutting down real systems.
+
+## Control channels
+
+### Ethernet
+
+```bash
+nc <simulator-ip> 5000
+```
+
+A new connection prints:
+
+```text
+OK NutUPS HID Simulator v2
+OK DISARMED
+```
+
+### UART
+
+Use `Serial1` at 115200 baud on Leonardo D0/D1. The UART accepts the same commands as TCP.
+
+## Command summary
+
+Read-only:
 
 ```text
 PING
@@ -80,45 +141,97 @@ NETWORK?
 HELP
 ```
 
-### State control
+Safety/control:
 
 ```text
 ARM ON|OFF
 RESET
+REPORT
+```
 
+State injection:
+
+```text
 AC ON|OFF
 BATTERY 0..100
 RUNTIME AUTO|0..65535
 VOLTAGE 0..65535
+LOAD 0..100
+INPUTVOLTAGE 0..65535
+OUTPUTVOLTAGE 0..65535
+STARTDELAY -1..32767
 CHARGING AUTO|ON|OFF
 LOWBAT AUTO|ON|OFF
 OVERLOAD ON|OFF
 REPLACE ON|OFF
 COMMLOST ON|OFF
 SHUTDOWN ON|OFF
-REPORT
 ```
 
-`VOLTAGE` is expressed in centivolts to match the HID descriptor. For example, `1300` represents 13.00 V.
+Voltage values are centivolts on the wire:
 
-With `RUNTIME AUTO`, runtime-to-empty scales from `iAvgTimeToEmpty` according to the current battery percentage.
+```text
+1300  = 13.00 V
+23000 = 230.00 V
+```
 
-With `LOWBAT AUTO`, the HID `BelowRemainingCapacityLimit` flag becomes active at or below `iRemnCapacityLimit` (5% by default).
+Use [CONTROL_PROTOCOL.md](CONTROL_PROTOCOL.md) for the full reference.
 
-## Example sessions
+## Dynamic model
 
-### Basic outage
+### Runtime
+
+`RUNTIME AUTO` scales runtime according to battery charge and the configured full-runtime reference.
+
+### Charging
+
+`CHARGING AUTO` reports charging when AC is present and battery charge is below 100%.
+
+### Low battery
+
+`LOWBAT AUTO` becomes active at or below the default 5% remaining-capacity limit.
+
+### Remaining-time limit
+
+The default low-runtime threshold is 600 seconds. While discharging, runtime at or below this threshold sets the remaining-time-limit-expired condition and contributes to shutdown-imminent behavior.
+
+## NUT-facing measurements
+
+The simulator exposes the base HIDPowerDevice fields plus the NUT extension:
+
+```text
+battery.charge
+battery.runtime
+battery.voltage
+battery.voltage.nominal
+battery.charge.low
+battery.charge.warning
+battery.runtime.low
+battery.type
+ups.load
+input.voltage
+output.voltage
+ups.delay.start / ups.timer.start
+ups.delay.shutdown / ups.timer.shutdown
+ups.timer.reboot
+ups.status
+```
+
+See [NUT_VARIABLES.md](NUT_VARIABLES.md) for exact HID paths.
+
+## Example outage
 
 ```text
 ARM ON
 AC OFF
 BATTERY 70
+LOAD 55
 STATUS?
 ```
 
-The host should observe an on-battery / discharging condition.
+The NUT host should observe on-battery/discharging state.
 
-### Low battery
+## Example low battery
 
 ```text
 ARM ON
@@ -128,23 +241,34 @@ RUNTIME 300
 STATUS?
 ```
 
-This should assert both the low-battery capacity flag and, because runtime is below the default 600-second remaining-time limit, the remaining-time-limit-expired flag.
+This activates low-battery state and places runtime below the default 600-second remaining-time limit.
 
-### Overload
+## Example voltage/load simulation
 
 ```text
 ARM ON
-OVERLOAD ON
+LOAD 80
+INPUTVOLTAGE 21500
+OUTPUTVOLTAGE 22950
 STATUS?
 ```
 
-### Power restored
+NUT should report approximately:
+
+```text
+ups.load: 80
+input.voltage: 215.0
+output.voltage: 229.5
+```
+
+## Example restoration
 
 ```text
 AC ON
 BATTERY 45
 RUNTIME AUTO
 LOWBAT AUTO
+CHARGING AUTO
 OVERLOAD OFF
 REPLACE OFF
 COMMLOST OFF
@@ -152,63 +276,55 @@ SHUTDOWN OFF
 STATUS?
 ```
 
-Charging is automatically reported while AC is present and battery capacity is below 100%.
-
-### Finish a test safely
+Finish with:
 
 ```text
 RESET
 ```
 
-## Connecting from Linux
+## Python control
 
-For a simple interactive test:
+The preferred automation layer is the repository's Python driver:
 
-```bash
-nc <simulator-ip> 5000
+```python
+from ups_simulator import UpsSimulator
+
+with UpsSimulator.tcp("192.168.1.50") as ups:
+    with ups.armed_session():
+        ups.set_ac(False)
+        ups.set_battery(40)
+        ups.set_load(65)
+        ups.set_input_voltage(228.5)
+        ups.set_output_voltage(230.1)
+        print(ups.status())
 ```
 
-Then enter commands such as:
+`armed_session()` resets the simulator on exit, including exception paths.
+
+See [the Python driver manual](../python-driver/README.md).
+
+## Security
+
+The W5500 control protocol has no authentication or encryption. Do not expose TCP/5000 to an untrusted network.
+
+`ARM ON` protects against accidental mutation; it is not an authentication mechanism.
+
+## Current Leonardo resource use
+
+Reference CI build with Arduino AVR core 1.8.8 and Ethernet library 2.0.2:
 
 ```text
-STATUS?
-ARM ON
-AC OFF
-BATTERY 4
+Original UPS example:
+  flash  9,818 / 28,672 bytes (34%)
+  RAM      302 / 2,560 bytes (11%)
+
+Ethernet/NUT simulator:
+  flash 28,070 / 28,672 bytes (97%)
+  RAM    1,296 / 2,560 bytes (50%)
 ```
 
-## Integration with Nut-ups
+Only about 602 bytes of flash headroom remain. Treat the AVR firmware as effectively feature-frozen. Put scenario engines, web/Cockpit UI, persistent configuration, authentication, logs, and orchestration in the Linux/Python side.
 
-The recommended architecture is:
+## Known limitation: communication loss
 
-```text
-                     control LAN
-Cockpit / test tool --------------------+
-                                        |
-                                        v
-                                  +-----------+
-                                  |  W5500    |
-                                  +-----+-----+
-                                        |
-                                  Arduino Leonardo
-                                        |
-                                  USB HID Power Device
-                                        |
-                                        v
-                                Nut-ups server under test
-```
-
-The Nut-ups host should consume the USB HID UPS normally. The management side should use the Ethernet control port only to inject simulated conditions.
-
-Do not expose TCP port 5000 to an untrusted network. The current protocol intentionally has no authentication; the `ARM` mechanism protects against accidental state changes, not hostile access.
-
-## Leonardo resource use
-
-The GitHub Actions compile check uses Arduino AVR core 1.8.8 and Ethernet library 2.0.2.
-
-Current build results:
-
-- original UPS example: 9,818 / 28,672 bytes flash (34%), 302 / 2,560 bytes static RAM (11%)
-- Ethernet simulator: 27,678 / 28,672 bytes flash (96%), 1,246 / 2,560 bytes static RAM (48%)
-
-The Leonardo build therefore fits and is usable, but flash headroom is small. Keep the Leonardo implementation intentionally compact. A future port to a native-USB MCU with more flash/RAM would be preferable if the simulator grows substantially (web UI, authentication, scenario storage, TLS, or richer automation).
+`COMMLOST ON` sets the HID `CommunicationLost` flag, but it does not physically detach USB. It therefore does not guarantee a NUT driver-level `NOCOMM` event. Real USB transport-loss testing needs a separate mechanism.

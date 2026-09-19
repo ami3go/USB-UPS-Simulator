@@ -1,70 +1,184 @@
-= HID UPS Power Device Library for Arduino =
+= USB UPS Simulator for Arduino Leonardo + W5500
 
+A USB HID UPS simulator for NUT/Nut-ups testing.
 
-https://projecthub.arduino.cc/abratchik/hid-compliant-ups-with-arduino-3e597a
+The reference firmware runs on an Arduino Leonardo/ATmega32U4 and presents a USB HID Power Device to the system under test. A W5500 Ethernet shield provides a separate TCP control channel so test software can inject mains failure, battery charge/runtime, load, input/output voltage, low-battery, overload, replacement-battery, and shutdown conditions without disturbing the USB connection.
 
+Hardware UART (`Serial1`) provides a fallback control path using the same protocol.
 
-This library allows an Arduino board with USB capabilities to act as a HID-compliant UPS according to USB HID specifications.
-The library is useful if you want to build a smart UPS or other power device, which can report its state to the PC host
-or perform power on/power off operations as necessary for your project.
+== Architecture
 
-For more information about USB HID specs please read https://www.usb.org/sites/default/files/pdcv11.pdf
+[source,text]
+----
+                  management / test network
+                          TCP 5000
+                             |
+                             v
+                    +----------------+
+                    | W5500 Ethernet |
+                    +-------+--------+
+                            |
+                         SPI/ICSP
+                            |
+                    +-------+--------+
+                    | Arduino        |
+                    | Leonardo       |
+                    +---+--------+---+
+                        |        |
+                 USB HID UPS   Serial1
+                        |       115200
+                        v
+                 NUT host under test
+----
 
-== Supported Arduinos ==
-* Leonardo
-* (Pro)Micro
+The USB connection is the simulated UPS interface. Ethernet/UART are the simulator control interfaces.
 
-== Setup & Usage ==
-Setup is very simple. Just clone this repository to Arduino libraries, then upload the sketch UPS.ino
-from the /examples folder. Once upload is completed successfully you will find HID Device Battery in
-your system.
+== Key features
 
-You migth need to change `bCapacityMode` from `2` (%) to `1` (mWh) if you want Windows to report battery capacity percentage on laptops that already has a battery installed (see https://github.com/abratchik/HIDPowerDevice/issues/11).
+* USB HID Power Device / UPS based on the HIDPowerDevice library
+* upstream NUT `usbhid-ups` Arduino HID compatibility
+* W5500 Ethernet control on TCP port `5000`
+* `Serial1` UART control at `115200`
+* DHCP with `169.254.42.42/16` fallback
+* explicit `ARM ON` safety gate before state-changing commands
+* `RESET` / `ARM OFF` safe-state recovery
+* non-blocking firmware loop
+* Python API and `ups-sim` CLI
+* NUT-facing battery, runtime, voltage, load, input/output voltage and delay fields
+* automated Arduino and Python CI
 
-== Ethernet-controlled UPS simulator ==
+== Supported reference hardware
 
-The `examples/UPS_Simulator_Ethernet` sketch turns a Leonardo plus W5500 Ethernet shield into a remotely controlled USB HID UPS simulator.
-The USB connection remains the UPS interface to the host under test, while Ethernet TCP port `5000` is used to inject simulated AC failure,
-battery capacity/runtime, low-battery, overload, replacement-battery, communication-loss and shutdown conditions. Hardware UART (`Serial1`) provides
-a bench-control fallback using the same command protocol.
+* Arduino Leonardo or compatible ATmega32U4 native-USB board
+* W5500 Ethernet shield with the 2x3 ICSP connector populated
 
-The simulator starts disarmed in a safe online/100% state. Use `ARM ON` before changing UPS state; `ARM OFF` or `RESET` restores the safe state.
-See `docs/ETHERNET_SIMULATOR.md` for wiring, power, protocol, test sequences and Nut-ups integration notes.
+On Leonardo, SPI is taken from the ICSP header. Common UNO-style W5500 shields that do not connect to the ICSP header are not directly compatible.
 
-The Leonardo build is verified by GitHub Actions. The Ethernet simulator currently uses about 96% of available Leonardo flash, so substantial future features
-should be moved to a native-USB MCU with more program memory rather than expanding the AVR build indefinitely.
+Standard shield usage:
 
-=== Python control driver
+[cols="1,1,3",options="header"]
+|===
+|Function |Connection |Notes
 
-The `python-driver` folder contains a reusable Python API and command-line tool for controlling the simulator over W5500 Ethernet or the optional `Serial1` UART fallback.
+|W5500 SPI
+|ICSP
+|MOSI/MISO/SCK
 
-Install it from a repository checkout:
+|W5500 CS
+|D10
+|Reserved for Ethernet
+
+|microSD CS
+|D4
+|Firmware keeps HIGH; leave SD unused for commissioning
+
+|UART
+|D0/D1
+|`Serial1`, 115200 baud
+
+|USB HID UPS
+|Leonardo USB
+|Connect to NUT/system-under-test host
+|===
+
+== Quick start
+
+=== 1. Clone into the Arduino library directory
+
+[source,shell]
+----
+mkdir -p ~/Arduino/libraries
+cd ~/Arduino/libraries
+git clone https://github.com/ami3go/USB-UPS-Simulator.git HIDPowerDevice
+cd HIDPowerDevice
+git switch main
+----
+
+=== 2. Install Arduino dependencies
+
+[source,shell]
+----
+arduino-cli core update-index
+arduino-cli core install arduino:avr
+arduino-cli lib install Ethernet
+----
+
+=== 3. Compile
+
+[source,shell]
+----
+arduino-cli compile \
+  --fqbn arduino:avr:leonardo \
+  ~/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet
+----
+
+=== 4. Upload
+
+[source,shell]
+----
+arduino-cli board list
+arduino-cli upload \
+  --fqbn arduino:avr:leonardo \
+  -p /dev/ttyACM0 \
+  ~/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet
+----
+
+Replace `/dev/ttyACM0` with the actual Leonardo port. Arduino IDE 2.x is also supported; see the flashing guide.
+
+=== 5. Connect over Ethernet
+
+The firmware requests DHCP first. If DHCP fails it falls back to:
+
+[source,text]
+----
+169.254.42.42/16
+TCP 5000
+----
+
+Connect:
+
+[source,shell]
+----
+nc <simulator-ip> 5000
+----
+
+A new connection reports that the simulator is disarmed.
+
+=== 6. Run a safe first test
+
+[source,text]
+----
+PING
+STATUS?
+ARM ON
+AC OFF
+BATTERY 40
+LOAD 65
+INPUTVOLTAGE 22850
+OUTPUTVOLTAGE 23010
+STATUS?
+RESET
+----
+
+Voltage values in the wire protocol are centivolts (`23000` = 230.00 V).
+
+== Python control driver
+
+Install from the repository:
 
 [source,shell]
 ----
 python -m pip install -e ./python-driver
 ----
 
-For UART support install the optional serial dependency:
+For UART support:
 
 [source,shell]
 ----
 python -m pip install -e './python-driver[serial]'
 ----
 
-Example CLI control:
-
-[source,shell]
-----
-ups-sim --host 192.168.1.50 status
-ups-sim --host 192.168.1.50 arm
-ups-sim --host 192.168.1.50 ac off
-ups-sim --host 192.168.1.50 battery 4
-ups-sim --host 192.168.1.50 runtime 300
-ups-sim --host 192.168.1.50 reset
-----
-
-Example Python API:
+Example:
 
 [source,python]
 ----
@@ -73,120 +187,170 @@ from ups_simulator import UpsSimulator
 with UpsSimulator.tcp("192.168.1.50") as ups:
     with ups.armed_session():
         ups.set_ac(False)
-        ups.set_battery(4)
+        ups.set_battery(40)
+        ups.set_load(65)
+        ups.set_input_voltage(228.5)
+        ups.set_output_voltage(230.1)
         ups.set_runtime(300)
         print(ups.status())
 ----
 
-`armed_session()` automatically sends `RESET` on exit, including when the test body raises an exception. This is the recommended pattern for automated NUT/Nut-ups shutdown testing.
-See `python-driver/README.md` for the complete API, CLI usage, UART setup, exceptions and safety notes.
+`armed_session()` sends `RESET` on exit, including exception paths.
 
-=== W5500 shield compatibility
-
-The recommended hardware combination for the Ethernet simulator is:
-
-* Arduino Leonardo or compatible ATmega32U4 board with native USB
-* W5500-based Arduino Ethernet shield, including common UNO R3 / Ethernet Shield 2 compatible clones
-* Shield with the 2x3 ICSP connector populated
-
-A shield sold as `UNO Shield Ethernet Shield W5500 R3 Development board FOR arduino` is expected to be compatible when it follows the standard W5500 shield pinout and includes the 2x3 ICSP connector.
-
-The ICSP connector is important on Leonardo because the hardware SPI signals are provided on the ICSP header rather than on D11/D12/D13 as on the UNO.
-A W5500 shield which only takes SPI from D11/D12/D13 and does not connect to the Leonardo ICSP header is not compatible without rewiring.
-
-Standard W5500 shield pin use for this project:
-
-[cols="1,1,3",options="header"]
-|===
-|Function |Pin / connection |Notes
-
-|W5500 SPI
-|ICSP header
-|MOSI, MISO and SCK are taken from the Leonardo ICSP connector.
-
-|W5500 chip select
-|D10
-|Reserved for Ethernet. Do not reuse D10 for simulator GPIO.
-
-|microSD chip select
-|D4
-|Reserved by common Ethernet shields. The simulator keeps D4 HIGH to de-select the unused SD interface.
-
-|USB HID UPS
-|Leonardo USB
-|Connects to the NUT / Nut-ups host under test.
-
-|UART fallback
-|D0 / D1 (`Serial1`)
-|Optional 115200-baud bench-control interface.
-
-|Ethernet control
-|RJ45 / W5500
-|TCP port `5000` by default.
-|===
-
-Do not insert a microSD card for initial testing. Keeping the SD interface unused reduces the chance of SPI-bus conflicts while commissioning the simulator.
-
-For full shutdown and power-restoration tests, externally power the Leonardo so the simulator remains alive if the USB host shuts down. USB should still remain connected to the host so it continues to appear as the HID UPS whenever the host is powered.
-
-Before first use, visually check that the shield has the 2x3 ICSP socket and that it physically mates with the Leonardo ICSP header when stacked.
-
-=== Quick commissioning test
-
-After flashing `examples/UPS_Simulator_Ethernet`, connect Ethernet and USB, then open the control interface:
+CLI example:
 
 [source,shell]
 ----
-nc <simulator-ip> 5000
+ups-sim --host 192.168.1.50 status
+ups-sim --host 192.168.1.50 arm
+ups-sim --host 192.168.1.50 ac off
+ups-sim --host 192.168.1.50 battery 40
+ups-sim --host 192.168.1.50 load 65
+ups-sim --host 192.168.1.50 input-voltage 228.5
+ups-sim --host 192.168.1.50 output-voltage 230.1
+ups-sim --host 192.168.1.50 reset
 ----
 
-Run:
+== NUT variables
+
+The current simulator exposes fields used by NUT's Arduino HID mapping, including:
 
 [source,text]
 ----
-PING
-STATUS?
-ARM ON
-AC OFF
-BATTERY 4
-RUNTIME 300
-STATUS?
-RESET
-STATUS?
+battery.type
+battery.voltage.nominal
+battery.voltage
+battery.runtime
+battery.runtime.low
+battery.charge
+battery.charge.low
+battery.charge.warning
+ups.load
+input.voltage
+output.voltage
+ups.delay.start
+ups.timer.start
+ups.delay.shutdown
+ups.timer.shutdown
+ups.timer.reboot
+ups.status
 ----
 
-Expected behavior:
+Verify the actual connected device with:
 
-* `PING` returns `OK PONG`.
-* After `AC OFF`, the host should see the UPS as on battery / discharging.
-* `BATTERY 4` should assert the low-battery condition when `LOWBAT` is in `AUTO` mode.
-* `RUNTIME 300` is below the default 600-second remaining-time limit and should assert the remaining-time-limit-expired condition.
-* `RESET` restores AC present, 100% battery and clears simulated fault conditions.
+[source,shell]
+----
+upsc <ups-name>@localhost
+----
 
-== Additional setup step on Linux hosts ==
-Copy linux/98-upower-hid.rules file to the /etc/udev/rules.d/ folder , then reboot. This is required for
-Linux device manager (udev) to recognize the Arduino board as UPS.
+== Safety
 
+The simulator can generate conditions that make NUT shut down real systems.
 
-== Tested on Operating Systems ==
-* Mac OSX 10.14.6 Mojave
-* Ubuntu 18.04.05 LTS
-* Windows 10
+* firmware starts disarmed
+* state-changing commands require `ARM ON`
+* `RESET` and `ARM OFF` restore the safe online state
+* TCP/5000 has no authentication or encryption
+* do not expose the control port to an untrusted network
+* validate shutdown behavior on a test host before connecting production NAS/servers
 
-== License ==
+`ARM ON` is a safety guard, not authentication.
 
-Copyright (c) Alex Bratchik 2020. All right reserved.
+== Full-cycle shutdown testing
 
-This library is free software; you can redistribute it and/or
-modify it under the terms of the GNU Lesser General Public
-License as published by the Free Software Foundation; either
-version 2.1 of the License, or (at your option) any later version.
+If the NUT host is expected to power down, power the Leonardo independently through a supported external-power input so that the W5500 remains reachable while the host is off. Keep USB connected so the host sees the HID UPS whenever it is powered.
 
-This library is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-Lesser General Public License for more details.
+See `docs/HARDWARE.md` for details.
 
-You should have received a copy of the GNU Lesser General Public
-License along with this library; if not, write to the Free Software
-Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+== Documentation
+
+[cols="1,3",options="header"]
+|===
+|Guide |Purpose
+
+|link:docs/README.md[Documentation index]
+|Entry point for all user/developer guides
+
+|link:docs/FLASHING.md[Flashing / quick start]
+|Arduino IDE and CLI installation, upload, recovery, first commissioning
+
+|link:docs/HARDWARE.md[Hardware guide]
+|W5500 compatibility, pinout, UART, powering
+
+|link:docs/CONTROL_PROTOCOL.md[Control protocol]
+|Complete TCP/UART command/status reference
+
+|link:python-driver/README.md[Python driver manual]
+|Python API, CLI, exceptions, examples and testing
+
+|link:docs/NUT_SETUP.md[NUT setup]
+|Configure `usbhid-ups`, debug and verify with `upsc`
+
+|link:docs/NUT_VARIABLES.md[NUT variable map]
+|Exact HID-to-NUT mappings
+
+|link:docs/PROGRAMMING_GUIDE.md[Firmware programming guide]
+|Architecture, state model, HID extension, development rules
+
+|link:docs/TROUBLESHOOTING.md[Troubleshooting]
+|Upload, Ethernet, HID, NUT, UART and Python diagnostics
+
+|link:docs/ETHERNET_SIMULATOR.md[Ethernet simulator design]
+|Operational design and known limits
+|===
+
+== Resource limit
+
+Reference CI build:
+
+[source,text]
+----
+Original UPS example:
+  flash  9818 / 28672 bytes (34%)
+  RAM     302 / 2560 bytes (11%)
+
+Ethernet/NUT simulator:
+  flash 28070 / 28672 bytes (97%)
+  RAM    1296 / 2560 bytes (50%)
+----
+
+Only about 602 bytes of flash headroom remain. The Leonardo firmware should be treated as effectively feature-frozen. Scenario engines, logging, configuration storage, authentication, web/Cockpit UI, retries and orchestration belong in the Python/Linux side.
+
+== Original HID UPS example
+
+The repository retains the original minimal example in:
+
+[source,text]
+----
+examples/UPS/UPS.ino
+----
+
+The NUT-specific descriptor extension is instantiated only by the Ethernet simulator so the original example remains minimal.
+
+== Linux desktop/UDev helper
+
+The repository includes:
+
+[source,text]
+----
+linux/98-upower-hid.rules
+----
+
+for Linux HID-power/UDev integration. NUT packages may install their own USB permission rules; do not replace package rules blindly.
+
+== CI
+
+GitHub Actions verifies:
+
+* original Leonardo UPS example compiles
+* Ethernet/NUT simulator compiles within Leonardo limits
+* Python driver tests on Python 3.9
+* Python driver tests on Python 3.13
+
+== License
+
+Copyright (c) Alex Bratchik 2020. All rights reserved.
+
+This library is free software; you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation, either version 2.1 of the License, or (at your option) any later version.
+
+This library is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more details.
