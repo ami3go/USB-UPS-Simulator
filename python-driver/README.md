@@ -29,7 +29,10 @@ with UpsSimulator.tcp("192.168.1.50") as ups:
 
     with ups.armed_session():
         ups.set_ac(False)
-        ups.set_battery(4)
+        ups.set_battery(40)
+        ups.set_load(65)
+        ups.set_input_voltage(228.5)
+        ups.set_output_voltage(230.1)
         ups.set_runtime(300)
         print(ups.status())
 
@@ -57,14 +60,19 @@ with UpsSimulator.serial("/dev/ttyUSB0") as ups:
 - battery percentage
 - runtime and runtime mode
 - battery voltage
+- load percentage (`ups.load`)
+- input voltage (`input.voltage`)
+- output voltage (`output.voltage`)
 - charging state/mode
 - low-battery state/mode
 - overload
 - replacement-battery flag
 - communication-loss flag
 - shutdown request/imminent state
-- host shutdown/reboot delays
+- host start/shutdown/reboot delays
 - simulator IP address
+
+Voltage fields are also exposed as convenience properties in volts.
 
 `network_status()` returns a `NetworkStatus` dataclass.
 
@@ -76,9 +84,13 @@ ups.disarm()
 ups.reset()
 ups.set_ac(True)
 ups.set_battery(75)
+ups.set_load(50)
 ups.set_runtime(1200)
-ups.set_runtime(None)              # AUTO
-ups.set_voltage(13.2)              # volts
+ups.set_runtime(None)                  # AUTO
+ups.set_voltage(13.2)                  # battery volts
+ups.set_input_voltage(230.0)           # AC input volts
+ups.set_output_voltage(229.5)          # UPS output volts
+ups.set_start_delay(30)                # -1 disables pending startup
 ups.set_charging("auto")
 ups.set_low_battery("auto")
 ups.set_overload(True)
@@ -110,11 +122,14 @@ The context manager sends `RESET` in `finally`, returning the simulator to its d
 After installation the `ups-sim` command is available.
 
 ```bash
-ups-sim --host 192.168.1.50 ping
 ups-sim --host 192.168.1.50 status
 ups-sim --host 192.168.1.50 arm
 ups-sim --host 192.168.1.50 ac off
-ups-sim --host 192.168.1.50 battery 4
+ups-sim --host 192.168.1.50 battery 40
+ups-sim --host 192.168.1.50 load 65
+ups-sim --host 192.168.1.50 input-voltage 228.5
+ups-sim --host 192.168.1.50 output-voltage 230.1
+ups-sim --host 192.168.1.50 start-delay 30
 ups-sim --host 192.168.1.50 runtime 300
 ups-sim --host 192.168.1.50 status
 ups-sim --host 192.168.1.50 reset
@@ -126,6 +141,10 @@ UART examples:
 ups-sim --serial /dev/ttyUSB0 status
 ups-sim --serial COM5 ping
 ```
+
+## NUT mapping
+
+See [`docs/NUT_VARIABLES.md`](../docs/NUT_VARIABLES.md) for the HID-to-NUT mapping and `upsc` verification procedure.
 
 ## Exceptions
 
