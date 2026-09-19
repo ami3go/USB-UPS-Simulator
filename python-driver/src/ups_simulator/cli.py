@@ -37,11 +37,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = commands.add_parser("battery")
     p.add_argument("percent", type=int)
 
+    p = commands.add_parser("load")
+    p.add_argument("percent", type=int)
+
     p = commands.add_parser("runtime")
     p.add_argument("seconds", help="seconds or 'auto'")
 
     p = commands.add_parser("voltage")
     p.add_argument("volts", type=float)
+
+    p = commands.add_parser("input-voltage")
+    p.add_argument("volts", type=float)
+
+    p = commands.add_parser("output-voltage")
+    p.add_argument("volts", type=float)
+
+    p = commands.add_parser("start-delay")
+    p.add_argument("seconds", type=int)
 
     for name in ("charging", "lowbat"):
         p = commands.add_parser(name)
@@ -93,6 +105,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sim.set_ac(args.state)
             elif cmd == "battery":
                 sim.set_battery(args.percent)
+            elif cmd == "load":
+                sim.set_load(args.percent)
             elif cmd == "runtime":
                 if args.seconds.lower() == "auto":
                     sim.set_runtime(None)
@@ -100,6 +114,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     sim.set_runtime(int(args.seconds))
             elif cmd == "voltage":
                 sim.set_voltage(args.volts)
+            elif cmd == "input-voltage":
+                sim.set_input_voltage(args.volts)
+            elif cmd == "output-voltage":
+                sim.set_output_voltage(args.volts)
+            elif cmd == "start-delay":
+                sim.set_start_delay(args.seconds)
             elif cmd == "charging":
                 sim.set_charging(args.mode)
             elif cmd == "lowbat":
