@@ -1,0 +1,27 @@
+name: Python driver tests
+
+on:
+  push:
+    paths:
+      - 'python-driver/**'
+      - '.github/workflows/python-driver.yml'
+  pull_request:
+    paths:
+      - 'python-driver/**'
+      - '.github/workflows/python-driver.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package
+        run: python -m pip install -e ./python-driver
+      - name: Run unit tests
+        run: python -m unittest discover -s python-driver/tests -v
