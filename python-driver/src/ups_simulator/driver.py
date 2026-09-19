@@ -88,8 +88,6 @@ class SocketLineTransport:
             return
         deadline = time.monotonic() + window
         while True:
-            # One recv() can contain both firmware greeting lines. Always
-            # consume complete lines already buffered before waiting on select().
             if b"\n" in self._rx:
                 self.greeting.append(self._readline())
                 continue
@@ -181,6 +179,9 @@ class SimulatorStatus:
     runtime_seconds: int
     runtime_mode: str
     voltage_centivolts: int
+    load_percent: int
+    input_voltage_centivolts: int
+    output_voltage_centivolts: int
     charging_mode: str
     charging_active: bool
     low_battery_mode: str
@@ -190,6 +191,7 @@ class SimulatorStatus:
     communication_lost: bool
     shutdown_requested: bool
     shutdown_imminent: bool
+    host_start_delay: int
     host_shutdown_delay: int
     host_reboot_delay: int
     ip: str
@@ -197,6 +199,14 @@ class SimulatorStatus:
     @property
     def voltage_volts(self) -> float:
         return self.voltage_centivolts / 100.0
+
+    @property
+    def input_voltage_volts(self) -> float:
+        return self.input_voltage_centivolts / 100.0
+
+    @property
+    def output_voltage_volts(self) -> float:
+        return self.output_voltage_centivolts / 100.0
 
 
 @dataclass(frozen=True)
@@ -303,6 +313,9 @@ class UpsSimulator:
             runtime_seconds=_as_int(values, "runtime"),
             runtime_mode=_need(values, "runtime_mode"),
             voltage_centivolts=_as_int(values, "voltage_cv"),
+            load_percent=_as_int(values, "load"),
+            input_voltage_centivolts=_as_int(values, "input_voltage_cv"),
+            output_voltage_centivolts=_as_int(values, "output_voltage_cv"),
             charging_mode=_need(values, "charging_mode"),
             charging_active=_as_bool(values, "charging_active"),
             low_battery_mode=_need(values, "lowbat_mode"),
@@ -312,6 +325,7 @@ class UpsSimulator:
             communication_lost=_as_bool(values, "commlost"),
             shutdown_requested=_as_bool(values, "shutdown"),
             shutdown_imminent=_as_bool(values, "shutdown_imminent"),
+            host_start_delay=_as_int(values, "host_start_delay"),
             host_shutdown_delay=_as_int(values, "host_shutdown_delay"),
             host_reboot_delay=_as_int(values, "host_reboot_delay"),
             ip=_need(values, "ip"),
@@ -346,6 +360,11 @@ class UpsSimulator:
             raise ValueError("battery percent must be in range 0..100")
         self.raw_command(f"BATTERY {percent}")
 
+    def set_load(self, percent: int) -> None:
+        if not 0 <= percent <= 100:
+            raise ValueError("load percent must be in range 0..100")
+        self.raw_command(f"LOAD {percent}")
+
     def set_runtime(self, seconds: Optional[int]) -> None:
         if seconds is None:
             self.raw_command("RUNTIME AUTO")
@@ -354,14 +373,41 @@ class UpsSimulator:
             raise ValueError("runtime must be in range 0..65535 seconds")
         self.raw_command(f"RUNTIME {seconds}")
 
+    @staticmethod
+    def _to_centivolts(volts: float) -> int:
+        centivolts = int(round(volts * 100.0))
+        if not 0 <= centivolts <= 65535:
+            raise ValueError("voltage must be in range 0..655.35 V")
+        return centivolts
+
     def set_voltage_centivolts(self, centivolts: int) -> None:
         if not 0 <= centivolts <= 65535:
             raise ValueError("voltage must be in range 0..65535 centivolts")
         self.raw_command(f"VOLTAGE {centivolts}")
 
     def set_voltage(self, volts: float) -> None:
-        centivolts = int(round(volts * 100.0))
-        self.set_voltage_centivolts(centivolts)
+        self.set_voltage_centivolts(self._to_centivolts(volts))
+
+    def set_input_voltage_centivolts(self, centivolts: int) -> None:
+        if not 0 <= centivolts <= 65535:
+            raise ValueError("input voltage must be in range 0..65535 centivolts")
+        self.raw_command(f"INPUTVOLTAGE {centivolts}")
+
+    def set_input_voltage(self, volts: float) -> None:
+        self.set_input_voltage_centivolts(self._to_centivolts(volts))
+
+    def set_output_voltage_centivolts(self, centivolts: int) -> None:
+        if not 0 <= centivolts <= 65535:
+            raise ValueError("output voltage must be in range 0..65535 centivolts")
+        self.raw_command(f"OUTPUTVOLTAGE {centivolts}")
+
+    def set_output_voltage(self, volts: float) -> None:
+        self.set_output_voltage_centivolts(self._to_centivolts(volts))
+
+    def set_start_delay(self, seconds: int) -> None:
+        if not -1 <= seconds <= 32767:
+            raise ValueError("start delay must be in range -1..32767 seconds")
+        self.raw_command(f"STARTDELAY {seconds}")
 
     @staticmethod
     def _mode(value: Union[bool, str]) -> str:
