@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nutups-simulator-control"
+version = "0.1.0"
+description = "Python control driver for the NutUPS Arduino USB HID UPS simulator"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "LGPL-2.1-or-later"}
+authors = [{name = "ami3go"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+serial = ["pyserial>=3.5"]
+
+[project.scripts]
+ups-sim = "ups_simulator.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
