@@ -1,4 +1,5 @@
 #include <HIDPowerDevice.h>
+#include <HIDPowerDeviceNUT.h>
 #include <SPI.h>
 #include <Ethernet.h>
 #include <strings.h>
@@ -10,8 +11,10 @@
 #define HEARTBEAT_INTERVAL_MS 1000UL
 #define SD_CS_PIN 4
 
-// Ethernet Shield 2 / common W5500 shields use D10 for Ethernet CS.
-// D4 is normally the SD-card CS, so keep it de-selected when SD is unused.
+// Pull the NUT-specific HID descriptor fragment into this sketch before USB
+// enumeration. The original minimal UPS example remains unchanged.
+HIDPowerDeviceNUT_ NutHidExtension;
+
 byte macAddress[] = { 0x02, 0x55, 0x50, 0x53, 0x00, 0x01 };
 IPAddress fallbackIp(169, 254, 42, 42);
 IPAddress fallbackDns(0, 0, 0, 0);
@@ -40,6 +43,7 @@ uint16_t iPrevRunTimeToEmpty = 0;
 uint16_t iAvgTimeToFull = 7200;
 uint16_t iAvgTimeToEmpty = 7200;
 uint16_t iRemainTimeLimit = 600;
+int16_t iDelayBe4Startup = -1;
 int16_t iDelayBe4Reboot = -1;
 int16_t iDelayBe4ShutDown = -1;
 uint16_t iManufacturerDate = 0;
@@ -53,6 +57,11 @@ const byte bCapacityGranularity2 = 1;
 byte iFullChargeCapacity = 100;
 byte iRemaining = 100;
 byte iPrevRemaining = 0;
+
+// Additional fields mapped by NUT's arduino-hid subdriver.
+byte iPercentLoad = 25;
+uint16_t iInputVoltage = 23000;  // 230.00 V in centivolts
+uint16_t iOutputVoltage = 23000; // 230.00 V in centivolts
 
 enum OverrideMode : int8_t {
   OVERRIDE_AUTO = -1,
@@ -97,8 +106,12 @@ void setSafeState() {
   iRemaining = 100;
   iVoltage = 1300;
   iRunTimeToEmpty = iAvgTimeToEmpty;
+  iDelayBe4Startup = -1;
   iDelayBe4Reboot = -1;
   iDelayBe4ShutDown = -1;
+  iPercentLoad = 25;
+  iInputVoltage = 23000;
+  iOutputVoltage = 23000;
 }
 
 bool parseOnOff(const char *token, bool &value) {
@@ -129,11 +142,18 @@ bool parseOverride(const char *token, OverrideMode &mode) {
 
 bool parseUnsigned(const char *token, unsigned long minValue, unsigned long maxValue, unsigned long &value) {
   if (!token || !*token) return false;
-
   char *end = NULL;
   unsigned long parsed = strtoul(token, &end, 10);
   if (*end != '\0' || parsed < minValue || parsed > maxValue) return false;
+  value = parsed;
+  return true;
+}
 
+bool parseSigned(const char *token, long minValue, long maxValue, long &value) {
+  if (!token || !*token) return false;
+  char *end = NULL;
+  long parsed = strtol(token, &end, 10);
+  if (*end != '\0' || parsed < minValue || parsed > maxValue) return false;
   value = parsed;
   return true;
 }
@@ -184,6 +204,9 @@ void sendUsbReports(bool force) {
   PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
   PowerDevice.sendReport(HID_PD_RUNTIMETOEMPTY, &iRunTimeToEmpty, sizeof(iRunTimeToEmpty));
   PowerDevice.sendReport(HID_PD_VOLTAGE, &iVoltage, sizeof(iVoltage));
+  PowerDevice.sendReport(HID_PD_PERCENTLOAD, &iPercentLoad, sizeof(iPercentLoad));
+  PowerDevice.sendReport(HID_PD_INPUTVOLTAGE, &iInputVoltage, sizeof(iInputVoltage));
+  PowerDevice.sendReport(HID_PD_OUTPUTVOLTAGE, &iOutputVoltage, sizeof(iOutputVoltage));
   PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
 
   iPreviousStatus = iPresentStatus;
@@ -207,6 +230,12 @@ void printStatus(Print &out) {
   out.print(sim.runtimeAuto ? F("auto") : F("manual"));
   out.print(F(" voltage_cv="));
   out.print(iVoltage);
+  out.print(F(" load="));
+  out.print(iPercentLoad);
+  out.print(F(" input_voltage_cv="));
+  out.print(iInputVoltage);
+  out.print(F(" output_voltage_cv="));
+  out.print(iOutputVoltage);
   out.print(F(" charging_mode="));
   out.print(overrideName(sim.charging));
   out.print(F(" charging_active="));
@@ -225,6 +254,8 @@ void printStatus(Print &out) {
   out.print(sim.shutdownRequested ? 1 : 0);
   out.print(F(" shutdown_imminent="));
   out.print(iPresentStatus.ShutdownImminent ? 1 : 0);
+  out.print(F(" host_start_delay="));
+  out.print(iDelayBe4Startup);
   out.print(F(" host_shutdown_delay="));
   out.print(iDelayBe4ShutDown);
   out.print(F(" host_reboot_delay="));
@@ -235,23 +266,14 @@ void printStatus(Print &out) {
 
 void printHelp(Print &out) {
   out.println(F("OK commands:"));
-  out.println(F("  PING"));
-  out.println(F("  IDENT?"));
-  out.println(F("  STATUS?"));
-  out.println(F("  NETWORK?"));
-  out.println(F("  ARM ON|OFF"));
-  out.println(F("  RESET"));
-  out.println(F("  AC ON|OFF"));
-  out.println(F("  BATTERY 0..100"));
-  out.println(F("  RUNTIME AUTO|0..65535"));
-  out.println(F("  VOLTAGE 0..65535        (centivolts)"));
-  out.println(F("  CHARGING AUTO|ON|OFF"));
-  out.println(F("  LOWBAT AUTO|ON|OFF"));
-  out.println(F("  OVERLOAD ON|OFF"));
-  out.println(F("  REPLACE ON|OFF"));
-  out.println(F("  COMMLOST ON|OFF"));
-  out.println(F("  SHUTDOWN ON|OFF"));
-  out.println(F("  REPORT"));
+  out.println(F("  PING | IDENT? | STATUS? | NETWORK?"));
+  out.println(F("  ARM ON|OFF | RESET | REPORT"));
+  out.println(F("  AC ON|OFF | BATTERY 0..100 | RUNTIME AUTO|0..65535"));
+  out.println(F("  VOLTAGE 0..65535 | LOAD 0..100"));
+  out.println(F("  INPUTVOLTAGE 0..65535 | OUTPUTVOLTAGE 0..65535"));
+  out.println(F("  STARTDELAY -1..32767"));
+  out.println(F("  CHARGING AUTO|ON|OFF | LOWBAT AUTO|ON|OFF"));
+  out.println(F("  OVERLOAD ON|OFF | REPLACE ON|OFF | COMMLOST ON|OFF | SHUTDOWN ON|OFF"));
 }
 
 bool requireArmed(Print &out) {
@@ -284,22 +306,18 @@ void handleCommand(char *line, Print &out) {
     out.println(F("OK PONG"));
     return;
   }
-
   if (!strcasecmp(command, "IDENT?")) {
-    out.println(F("OK NutUPS Ethernet HID UPS Simulator v1"));
+    out.println(F("OK NutUPS Ethernet HID UPS Simulator v2"));
     return;
   }
-
   if (!strcasecmp(command, "HELP") || !strcmp(command, "?")) {
     printHelp(out);
     return;
   }
-
   if (!strcasecmp(command, "STATUS?") || !strcasecmp(command, "STATUS")) {
     printStatus(out);
     return;
   }
-
   if (!strcasecmp(command, "NETWORK?")) {
     out.print(F("OK ip="));
     out.print(Ethernet.localIP());
@@ -346,27 +364,22 @@ void handleCommand(char *line, Print &out) {
     out.println(F("OK"));
     return;
   }
-
   if (!strcasecmp(command, "AC")) {
     applyBooleanCommand(out, arg, sim.acPresent);
     return;
   }
-
   if (!strcasecmp(command, "OVERLOAD")) {
     applyBooleanCommand(out, arg, sim.overload);
     return;
   }
-
   if (!strcasecmp(command, "REPLACE")) {
     applyBooleanCommand(out, arg, sim.needReplacement);
     return;
   }
-
   if (!strcasecmp(command, "COMMLOST")) {
     applyBooleanCommand(out, arg, sim.communicationLost);
     return;
   }
-
   if (!strcasecmp(command, "SHUTDOWN")) {
     applyBooleanCommand(out, arg, sim.shutdownRequested);
     return;
@@ -384,7 +397,6 @@ void handleCommand(char *line, Print &out) {
     out.println(F("OK"));
     return;
   }
-
   if (!strcasecmp(command, "LOWBAT")) {
     OverrideMode value;
     if (!parseOverride(arg, value)) {
@@ -398,61 +410,68 @@ void handleCommand(char *line, Print &out) {
     return;
   }
 
+  unsigned long value = 0;
   if (!strcasecmp(command, "BATTERY")) {
-    unsigned long value = 0;
     if (!parseUnsigned(arg, 0, iFullChargeCapacity, value)) {
       out.println(F("ERR expected BATTERY 0..100"));
       return;
     }
     iRemaining = (byte)value;
-    updateModel();
-    sendUsbReports(true);
-    out.println(F("OK"));
-    return;
-  }
-
-  if (!strcasecmp(command, "RUNTIME")) {
-    if (arg && !strcasecmp(arg, "AUTO")) {
-      sim.runtimeAuto = true;
-      updateModel();
-      sendUsbReports(true);
-      out.println(F("OK"));
+  } else if (!strcasecmp(command, "LOAD")) {
+    if (!parseUnsigned(arg, 0, 100, value)) {
+      out.println(F("ERR expected LOAD 0..100"));
       return;
     }
-
-    unsigned long value = 0;
-    if (!parseUnsigned(arg, 0, 65535UL, value)) {
-      out.println(F("ERR expected RUNTIME AUTO or 0..65535"));
-      return;
-    }
-    sim.runtimeAuto = false;
-    iRunTimeToEmpty = (uint16_t)value;
-    updateModel();
-    sendUsbReports(true);
-    out.println(F("OK"));
-    return;
-  }
-
-  if (!strcasecmp(command, "VOLTAGE")) {
-    unsigned long value = 0;
+    iPercentLoad = (byte)value;
+  } else if (!strcasecmp(command, "VOLTAGE")) {
     if (!parseUnsigned(arg, 0, 65535UL, value)) {
       out.println(F("ERR expected VOLTAGE 0..65535 centivolts"));
       return;
     }
     iVoltage = (uint16_t)value;
-    updateModel();
-    sendUsbReports(true);
-    out.println(F("OK"));
+  } else if (!strcasecmp(command, "INPUTVOLTAGE")) {
+    if (!parseUnsigned(arg, 0, 65535UL, value)) {
+      out.println(F("ERR expected INPUTVOLTAGE 0..65535 centivolts"));
+      return;
+    }
+    iInputVoltage = (uint16_t)value;
+  } else if (!strcasecmp(command, "OUTPUTVOLTAGE")) {
+    if (!parseUnsigned(arg, 0, 65535UL, value)) {
+      out.println(F("ERR expected OUTPUTVOLTAGE 0..65535 centivolts"));
+      return;
+    }
+    iOutputVoltage = (uint16_t)value;
+  } else if (!strcasecmp(command, "RUNTIME")) {
+    if (arg && !strcasecmp(arg, "AUTO")) {
+      sim.runtimeAuto = true;
+    } else {
+      if (!parseUnsigned(arg, 0, 65535UL, value)) {
+        out.println(F("ERR expected RUNTIME AUTO or 0..65535"));
+        return;
+      }
+      sim.runtimeAuto = false;
+      iRunTimeToEmpty = (uint16_t)value;
+    }
+  } else if (!strcasecmp(command, "STARTDELAY")) {
+    long signedValue = 0;
+    if (!parseSigned(arg, -1, 32767L, signedValue)) {
+      out.println(F("ERR expected STARTDELAY -1..32767"));
+      return;
+    }
+    iDelayBe4Startup = (int16_t)signedValue;
+  } else {
+    out.println(F("ERR unknown command; use HELP"));
     return;
   }
 
-  out.println(F("ERR unknown command; use HELP"));
+  updateModel();
+  sendUsbReports(true);
+  out.println(F("OK"));
 }
 
 void pollStream(Stream &input, Print &output, char *buffer, size_t &length, size_t capacity) {
   while (input.available() > 0) {
     const char c = (char)input.read();
-
     if (c == '\r') continue;
 
     if (c == '\n') {
@@ -472,14 +491,12 @@ void pollStream(Stream &input, Print &output, char *buffer, size_t &length, size
 }
 
 void initEthernet() {
-  // Ethernet Shield 2 SD-card chip select. Keep SD inactive.
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
 
   if (Ethernet.begin(macAddress) == 0) {
     Ethernet.begin(macAddress, fallbackIp, fallbackDns, fallbackGateway, fallbackSubnet);
   }
-
   controlServer.begin();
 }
 
@@ -493,6 +510,7 @@ void setupHid() {
   PowerDevice.setFeature(HID_PD_AVERAGETIME2FULL, &iAvgTimeToFull, sizeof(iAvgTimeToFull));
   PowerDevice.setFeature(HID_PD_AVERAGETIME2EMPTY, &iAvgTimeToEmpty, sizeof(iAvgTimeToEmpty));
   PowerDevice.setFeature(HID_PD_REMAINTIMELIMIT, &iRemainTimeLimit, sizeof(iRemainTimeLimit));
+  PowerDevice.setFeature(HID_PD_DELAYBE4STARTUP, &iDelayBe4Startup, sizeof(iDelayBe4Startup));
   PowerDevice.setFeature(HID_PD_DELAYBE4REBOOT, &iDelayBe4Reboot, sizeof(iDelayBe4Reboot));
   PowerDevice.setFeature(HID_PD_DELAYBE4SHUTDOWN, &iDelayBe4ShutDown, sizeof(iDelayBe4ShutDown));
 
@@ -500,6 +518,9 @@ void setupHid() {
   PowerDevice.setFeature(HID_PD_CAPACITYMODE, &bCapacityMode, sizeof(bCapacityMode));
   PowerDevice.setFeature(HID_PD_CONFIGVOLTAGE, &iConfigVoltage, sizeof(iConfigVoltage));
   PowerDevice.setFeature(HID_PD_VOLTAGE, &iVoltage, sizeof(iVoltage));
+  PowerDevice.setFeature(HID_PD_PERCENTLOAD, &iPercentLoad, sizeof(iPercentLoad));
+  PowerDevice.setFeature(HID_PD_INPUTVOLTAGE, &iInputVoltage, sizeof(iInputVoltage));
+  PowerDevice.setFeature(HID_PD_OUTPUTVOLTAGE, &iOutputVoltage, sizeof(iOutputVoltage));
 
   PowerDevice.setStringFeature(HID_PD_IDEVICECHEMISTRY, &bDeviceChemistry, STRING_DEVICECHEMISTRY);
   PowerDevice.setStringFeature(HID_PD_IOEMINFORMATION, &bOEMVendor, STRING_OEMVENDOR);
@@ -523,7 +544,6 @@ void setupHid() {
 void setup() {
   Serial.begin(UART_BAUD);
   Serial1.begin(UART_BAUD);
-
   pinMode(LED_BUILTIN, OUTPUT);
 
   setSafeState();
@@ -537,7 +557,6 @@ void setup() {
   Serial.print(Ethernet.localIP());
   Serial.print(':');
   Serial.println(CONTROL_PORT);
-
   Serial1.println(F("NutUPS simulator UART ready. Use HELP."));
 }
 
@@ -546,12 +565,11 @@ void loop() {
 
   if (!controlClient || !controlClient.connected()) {
     if (controlClient) controlClient.stop();
-
     EthernetClient candidate = controlServer.available();
     if (candidate) {
       controlClient = candidate;
       netLineLength = 0;
-      controlClient.println(F("OK NutUPS Ethernet HID UPS Simulator v1"));
+      controlClient.println(F("OK NutUPS Ethernet HID UPS Simulator v2"));
       controlClient.println(F("OK simulator starts DISARMED; use ARM ON before changing UPS state"));
     }
   }
@@ -559,7 +577,6 @@ void loop() {
   if (controlClient && controlClient.connected()) {
     pollStream(controlClient, controlClient, netLine, netLineLength, sizeof(netLine));
   }
-
   pollStream(Serial1, Serial1, uartLine, uartLineLength, sizeof(uartLine));
 
   updateModel();
