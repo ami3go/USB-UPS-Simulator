@@ -21,6 +21,19 @@ your system.
 
 You migth need to change `bCapacityMode` from `2` (%) to `1` (mWh) if you want Windows to report battery capacity percentage on laptops that already has a battery installed (see https://github.com/abratchik/HIDPowerDevice/issues/11).
 
+== Ethernet-controlled UPS simulator ==
+
+The `examples/UPS_Simulator_Ethernet` sketch turns a Leonardo plus W5500 Ethernet shield into a remotely controlled USB HID UPS simulator.
+The USB connection remains the UPS interface to the host under test, while Ethernet TCP port `5000` is used to inject simulated AC failure,
+battery capacity/runtime, low-battery, overload, replacement-battery, communication-loss and shutdown conditions. Hardware UART (`Serial1`) provides
+a bench-control fallback using the same command protocol.
+
+The simulator starts disarmed in a safe online/100% state. Use `ARM ON` before changing UPS state; `ARM OFF` or `RESET` restores the safe state.
+See `docs/ETHERNET_SIMULATOR.md` for wiring, power, protocol, test sequences and Nut-ups integration notes.
+
+The Leonardo build is verified by GitHub Actions. The Ethernet simulator currently uses about 96% of available Leonardo flash, so substantial future features
+should be moved to a native-USB MCU with more program memory rather than expanding the AVR build indefinitely.
+
 == Additional setup step on Linux hosts ==
 Copy linux/98-upower-hid.rules file to the /etc/udev/rules.d/ folder , then reboot. This is required for
 Linux device manager (udev) to recognize the Arduino board as UPS. 
