@@ -4,7 +4,7 @@
 https://projecthub.arduino.cc/abratchik/hid-compliant-ups-with-arduino-3e597a
 
 
-This library allows an Arduino board with USB capabilities to act as a HID-compliant UPS according to USB HID specifications. 
+This library allows an Arduino board with USB capabilities to act as a HID-compliant UPS according to USB HID specifications.
 The library is useful if you want to build a smart UPS or other power device, which can report its state to the PC host
 or perform power on/power off operations as necessary for your project.
 
@@ -15,8 +15,8 @@ For more information about USB HID specs please read https://www.usb.org/sites/d
 * (Pro)Micro
 
 == Setup & Usage ==
-Setup is very simple. Just clone this repository to Arduino libraries, then upload the sketch UPS.ino 
-from the /examples folder. Once upload is completed successfully you will find HID Device Battery in  
+Setup is very simple. Just clone this repository to Arduino libraries, then upload the sketch UPS.ino
+from the /examples folder. Once upload is completed successfully you will find HID Device Battery in
 your system.
 
 You migth need to change `bCapacityMode` from `2` (%) to `1` (mWh) if you want Windows to report battery capacity percentage on laptops that already has a battery installed (see https://github.com/abratchik/HIDPowerDevice/issues/11).
@@ -34,14 +34,96 @@ See `docs/ETHERNET_SIMULATOR.md` for wiring, power, protocol, test sequences and
 The Leonardo build is verified by GitHub Actions. The Ethernet simulator currently uses about 96% of available Leonardo flash, so substantial future features
 should be moved to a native-USB MCU with more program memory rather than expanding the AVR build indefinitely.
 
+=== W5500 shield compatibility
+
+The recommended hardware combination for the Ethernet simulator is:
+
+* Arduino Leonardo or compatible ATmega32U4 board with native USB
+* W5500-based Arduino Ethernet shield, including common UNO R3 / Ethernet Shield 2 compatible clones
+* Shield with the 2x3 ICSP connector populated
+
+A shield sold as `UNO Shield Ethernet Shield W5500 R3 Development board FOR arduino` is expected to be compatible when it follows the standard W5500 shield pinout and includes the 2x3 ICSP connector.
+
+The ICSP connector is important on Leonardo because the hardware SPI signals are provided on the ICSP header rather than on D11/D12/D13 as on the UNO.
+A W5500 shield which only takes SPI from D11/D12/D13 and does not connect to the Leonardo ICSP header is not compatible without rewiring.
+
+Standard W5500 shield pin use for this project:
+
+[cols="1,1,3",options="header"]
+|===
+|Function |Pin / connection |Notes
+
+|W5500 SPI
+|ICSP header
+|MOSI, MISO and SCK are taken from the Leonardo ICSP connector.
+
+|W5500 chip select
+|D10
+|Reserved for Ethernet. Do not reuse D10 for simulator GPIO.
+
+|microSD chip select
+|D4
+|Reserved by common Ethernet shields. The simulator keeps D4 HIGH to de-select the unused SD interface.
+
+|USB HID UPS
+|Leonardo USB
+|Connects to the NUT / Nut-ups host under test.
+
+|UART fallback
+|D0 / D1 (`Serial1`)
+|Optional 115200-baud bench-control interface.
+
+|Ethernet control
+|RJ45 / W5500
+|TCP port `5000` by default.
+|===
+
+Do not insert a microSD card for initial testing. Keeping the SD interface unused reduces the chance of SPI-bus conflicts while commissioning the simulator.
+
+For full shutdown and power-restoration tests, externally power the Leonardo so the simulator remains alive if the USB host shuts down. USB should still remain connected to the host so it continues to appear as the HID UPS whenever the host is powered.
+
+Before first use, visually check that the shield has the 2x3 ICSP socket and that it physically mates with the Leonardo ICSP header when stacked.
+
+=== Quick commissioning test
+
+After flashing `examples/UPS_Simulator_Ethernet`, connect Ethernet and USB, then open the control interface:
+
+[source,shell]
+----
+nc <simulator-ip> 5000
+----
+
+Run:
+
+[source,text]
+----
+PING
+STATUS?
+ARM ON
+AC OFF
+BATTERY 4
+RUNTIME 300
+STATUS?
+RESET
+STATUS?
+----
+
+Expected behavior:
+
+* `PING` returns `OK PONG`.
+* After `AC OFF`, the host should see the UPS as on battery / discharging.
+* `BATTERY 4` should assert the low-battery condition when `LOWBAT` is in `AUTO` mode.
+* `RUNTIME 300` is below the default 600-second remaining-time limit and should assert the remaining-time-limit-expired condition.
+* `RESET` restores AC present, 100% battery and clears simulated fault conditions.
+
 == Additional setup step on Linux hosts ==
 Copy linux/98-upower-hid.rules file to the /etc/udev/rules.d/ folder , then reboot. This is required for
-Linux device manager (udev) to recognize the Arduino board as UPS. 
+Linux device manager (udev) to recognize the Arduino board as UPS.
 
 
 == Tested on Operating Systems ==
 * Mac OSX 10.14.6 Mojave
-* Ubuntu 18.04.05 LTS 
+* Ubuntu 18.04.05 LTS
 * Windows 10
 
 == License ==
