@@ -34,6 +34,53 @@ See `docs/ETHERNET_SIMULATOR.md` for wiring, power, protocol, test sequences and
 The Leonardo build is verified by GitHub Actions. The Ethernet simulator currently uses about 96% of available Leonardo flash, so substantial future features
 should be moved to a native-USB MCU with more program memory rather than expanding the AVR build indefinitely.
 
+=== Python control driver
+
+The `python-driver` folder contains a reusable Python API and command-line tool for controlling the simulator over W5500 Ethernet or the optional `Serial1` UART fallback.
+
+Install it from a repository checkout:
+
+[source,shell]
+----
+python -m pip install -e ./python-driver
+----
+
+For UART support install the optional serial dependency:
+
+[source,shell]
+----
+python -m pip install -e './python-driver[serial]'
+----
+
+Example CLI control:
+
+[source,shell]
+----
+ups-sim --host 192.168.1.50 status
+ups-sim --host 192.168.1.50 arm
+ups-sim --host 192.168.1.50 ac off
+ups-sim --host 192.168.1.50 battery 4
+ups-sim --host 192.168.1.50 runtime 300
+ups-sim --host 192.168.1.50 reset
+----
+
+Example Python API:
+
+[source,python]
+----
+from ups_simulator import UpsSimulator
+
+with UpsSimulator.tcp("192.168.1.50") as ups:
+    with ups.armed_session():
+        ups.set_ac(False)
+        ups.set_battery(4)
+        ups.set_runtime(300)
+        print(ups.status())
+----
+
+`armed_session()` automatically sends `RESET` on exit, including when the test body raises an exception. This is the recommended pattern for automated NUT/Nut-ups shutdown testing.
+See `python-driver/README.md` for the complete API, CLI usage, UART setup, exceptions and safety notes.
+
 === W5500 shield compatibility
 
 The recommended hardware combination for the Ethernet simulator is:
