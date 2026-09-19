@@ -1,0 +1,34 @@
+name: Arduino compile
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  leonardo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install AVR core and Ethernet library
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          arduino-cli lib install Ethernet
+
+      - name: Install this repository as an Arduino library
+        run: |
+          mkdir -p "$HOME/Arduino/libraries/HIDPowerDevice"
+          cp -R src examples library.properties keywords.txt "$HOME/Arduino/libraries/HIDPowerDevice/"
+
+      - name: Compile original UPS example for Leonardo
+        run: |
+          arduino-cli compile --fqbn arduino:avr:leonardo "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS"
+
+      - name: Compile Ethernet simulator for Leonardo
+        run: |
+          arduino-cli compile --fqbn arduino:avr:leonardo "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet"
