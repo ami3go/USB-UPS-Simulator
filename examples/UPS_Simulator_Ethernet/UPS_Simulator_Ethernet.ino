@@ -1,0 +1,574 @@
+#include <HIDPowerDevice.h>
+#include <SPI.h>
+#include <Ethernet.h>
+#include <strings.h>
+#include <stdlib.h>
+
+#define CONTROL_PORT 5000
+#define UART_BAUD 115200
+#define REPORT_INTERVAL_MS 5000UL
+#define HEARTBEAT_INTERVAL_MS 1000UL
+#define SD_CS_PIN 4
+
+// Ethernet Shield 2 / common W5500 shields use D10 for Ethernet CS.
+// D4 is normally the SD-card CS, so keep it de-selected when SD is unused.
+byte macAddress[] = { 0x02, 0x55, 0x50, 0x53, 0x00, 0x01 };
+IPAddress fallbackIp(169, 254, 42, 42);
+IPAddress fallbackDns(0, 0, 0, 0);
+IPAddress fallbackGateway(0, 0, 0, 0);
+IPAddress fallbackSubnet(255, 255, 0, 0);
+
+EthernetServer controlServer(CONTROL_PORT);
+EthernetClient controlClient;
+
+const char STRING_DEVICECHEMISTRY[] PROGMEM = "PbAc";
+const char STRING_OEMVENDOR[] PROGMEM = "NutUPS-Simulator";
+const char STRING_SERIAL[] PROGMEM = "NUTSIM01";
+
+const byte bDeviceChemistry = IDEVICECHEMISTRY;
+const byte bOEMVendor = IOEMVENDOR;
+
+PresentStatus iPresentStatus = {}, iPreviousStatus = {};
+
+byte bRechargable = 1;
+byte bCapacityMode = 2; // percent
+
+const uint16_t iConfigVoltage = 1380; // centivolts
+uint16_t iVoltage = 1300;
+uint16_t iRunTimeToEmpty = 7200;
+uint16_t iPrevRunTimeToEmpty = 0;
+uint16_t iAvgTimeToFull = 7200;
+uint16_t iAvgTimeToEmpty = 7200;
+uint16_t iRemainTimeLimit = 600;
+int16_t iDelayBe4Reboot = -1;
+int16_t iDelayBe4ShutDown = -1;
+uint16_t iManufacturerDate = 0;
+byte iAudibleAlarmCtrl = 2;
+
+const byte iDesignCapacity = 100;
+byte iWarnCapacityLimit = 10;
+byte iRemnCapacityLimit = 5;
+const byte bCapacityGranularity1 = 1;
+const byte bCapacityGranularity2 = 1;
+byte iFullChargeCapacity = 100;
+byte iRemaining = 100;
+byte iPrevRemaining = 0;
+
+enum OverrideMode : int8_t {
+  OVERRIDE_AUTO = -1,
+  OVERRIDE_OFF = 0,
+  OVERRIDE_ON = 1
+};
+
+struct SimulatorState {
+  bool armed;
+  bool acPresent;
+  bool overload;
+  bool needReplacement;
+  bool communicationLost;
+  bool shutdownRequested;
+  bool runtimeAuto;
+  OverrideMode charging;
+  OverrideMode lowBattery;
+};
+
+SimulatorState sim;
+
+unsigned long lastReportMs = 0;
+unsigned long lastHeartbeatMs = 0;
+bool heartbeatState = false;
+
+char netLine[96];
+size_t netLineLength = 0;
+char uartLine[96];
+size_t uartLineLength = 0;
+
+void setSafeState() {
+  sim.armed = false;
+  sim.acPresent = true;
+  sim.overload = false;
+  sim.needReplacement = false;
+  sim.communicationLost = false;
+  sim.shutdownRequested = false;
+  sim.runtimeAuto = true;
+  sim.charging = OVERRIDE_AUTO;
+  sim.lowBattery = OVERRIDE_AUTO;
+
+  iRemaining = 100;
+  iVoltage = 1300;
+  iRunTimeToEmpty = iAvgTimeToEmpty;
+  iDelayBe4Reboot = -1;
+  iDelayBe4ShutDown = -1;
+}
+
+bool parseOnOff(const char *token, bool &value) {
+  if (!token) return false;
+  if (!strcasecmp(token, "ON") || !strcmp(token, "1") || !strcasecmp(token, "TRUE")) {
+    value = true;
+    return true;
+  }
+  if (!strcasecmp(token, "OFF") || !strcmp(token, "0") || !strcasecmp(token, "FALSE")) {
+    value = false;
+    return true;
+  }
+  return false;
+}
+
+bool parseOverride(const char *token, OverrideMode &mode) {
+  if (!token) return false;
+  if (!strcasecmp(token, "AUTO")) {
+    mode = OVERRIDE_AUTO;
+    return true;
+  }
+
+  bool value = false;
+  if (!parseOnOff(token, value)) return false;
+  mode = value ? OVERRIDE_ON : OVERRIDE_OFF;
+  return true;
+}
+
+bool parseUnsigned(const char *token, unsigned long minValue, unsigned long maxValue, unsigned long &value) {
+  if (!token || !*token) return false;
+
+  char *end = NULL;
+  unsigned long parsed = strtoul(token, &end, 10);
+  if (*end != '\0' || parsed < minValue || parsed > maxValue) return false;
+
+  value = parsed;
+  return true;
+}
+
+const __FlashStringHelper *overrideName(OverrideMode mode) {
+  if (mode == OVERRIDE_ON) return F("on");
+  if (mode == OVERRIDE_OFF) return F("off");
+  return F("auto");
+}
+
+void updateModel() {
+  if (sim.runtimeAuto) {
+    iRunTimeToEmpty = (uint16_t)((uint32_t)iAvgTimeToEmpty * iRemaining / iFullChargeCapacity);
+  }
+
+  const bool autoCharging = sim.acPresent && (iRemaining < iFullChargeCapacity);
+  const bool charging = (sim.charging == OVERRIDE_AUTO) ? autoCharging : (sim.charging == OVERRIDE_ON);
+  const bool discharging = !sim.acPresent && iRemaining > 0;
+  const bool autoLowBattery = iRemaining <= iRemnCapacityLimit;
+  const bool lowBattery = (sim.lowBattery == OVERRIDE_AUTO) ? autoLowBattery : (sim.lowBattery == OVERRIDE_ON);
+
+  iPresentStatus.Charging = charging;
+  iPresentStatus.Discharging = discharging;
+  iPresentStatus.ACPresent = sim.acPresent;
+  iPresentStatus.BatteryPresent = 1;
+  iPresentStatus.BelowRemainingCapacityLimit = lowBattery;
+  iPresentStatus.RemainingTimeLimitExpired = discharging && (iRunTimeToEmpty <= iRemainTimeLimit);
+  iPresentStatus.NeedReplacement = sim.needReplacement;
+  iPresentStatus.VoltageNotRegulated = 0;
+  iPresentStatus.FullyCharged = iRemaining >= iFullChargeCapacity;
+  iPresentStatus.FullyDischarged = iRemaining == 0;
+  iPresentStatus.ShutdownRequested = sim.armed && (sim.shutdownRequested || (iDelayBe4ShutDown > 0));
+  iPresentStatus.ShutdownImminent =
+      iPresentStatus.ShutdownRequested || iPresentStatus.RemainingTimeLimitExpired;
+  iPresentStatus.CommunicationLost = sim.communicationLost;
+  iPresentStatus.Overload = sim.overload;
+}
+
+void sendUsbReports(bool force) {
+  const unsigned long now = millis();
+  const bool changed =
+      (iPresentStatus != iPreviousStatus) ||
+      (iRemaining != iPrevRemaining) ||
+      (iRunTimeToEmpty != iPrevRunTimeToEmpty);
+
+  if (!force && !changed && (now - lastReportMs < REPORT_INTERVAL_MS)) return;
+
+  PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
+  PowerDevice.sendReport(HID_PD_RUNTIMETOEMPTY, &iRunTimeToEmpty, sizeof(iRunTimeToEmpty));
+  PowerDevice.sendReport(HID_PD_VOLTAGE, &iVoltage, sizeof(iVoltage));
+  PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
+
+  iPreviousStatus = iPresentStatus;
+  iPrevRemaining = iRemaining;
+  iPrevRunTimeToEmpty = iRunTimeToEmpty;
+  lastReportMs = now;
+}
+
+void printStatus(Print &out) {
+  updateModel();
+
+  out.print(F("OK armed="));
+  out.print(sim.armed ? 1 : 0);
+  out.print(F(" ac="));
+  out.print(sim.acPresent ? 1 : 0);
+  out.print(F(" battery="));
+  out.print(iRemaining);
+  out.print(F(" runtime="));
+  out.print(iRunTimeToEmpty);
+  out.print(F(" runtime_mode="));
+  out.print(sim.runtimeAuto ? F("auto") : F("manual"));
+  out.print(F(" voltage_cv="));
+  out.print(iVoltage);
+  out.print(F(" charging_mode="));
+  out.print(overrideName(sim.charging));
+  out.print(F(" charging_active="));
+  out.print(iPresentStatus.Charging ? 1 : 0);
+  out.print(F(" lowbat_mode="));
+  out.print(overrideName(sim.lowBattery));
+  out.print(F(" lowbat_active="));
+  out.print(iPresentStatus.BelowRemainingCapacityLimit ? 1 : 0);
+  out.print(F(" overload="));
+  out.print(sim.overload ? 1 : 0);
+  out.print(F(" replace="));
+  out.print(sim.needReplacement ? 1 : 0);
+  out.print(F(" commlost="));
+  out.print(sim.communicationLost ? 1 : 0);
+  out.print(F(" shutdown="));
+  out.print(sim.shutdownRequested ? 1 : 0);
+  out.print(F(" shutdown_imminent="));
+  out.print(iPresentStatus.ShutdownImminent ? 1 : 0);
+  out.print(F(" host_shutdown_delay="));
+  out.print(iDelayBe4ShutDown);
+  out.print(F(" host_reboot_delay="));
+  out.print(iDelayBe4Reboot);
+  out.print(F(" ip="));
+  out.println(Ethernet.localIP());
+}
+
+void printHelp(Print &out) {
+  out.println(F("OK commands:"));
+  out.println(F("  PING"));
+  out.println(F("  IDENT?"));
+  out.println(F("  STATUS?"));
+  out.println(F("  NETWORK?"));
+  out.println(F("  ARM ON|OFF"));
+  out.println(F("  RESET"));
+  out.println(F("  AC ON|OFF"));
+  out.println(F("  BATTERY 0..100"));
+  out.println(F("  RUNTIME AUTO|0..65535"));
+  out.println(F("  VOLTAGE 0..65535        (centivolts)"));
+  out.println(F("  CHARGING AUTO|ON|OFF"));
+  out.println(F("  LOWBAT AUTO|ON|OFF"));
+  out.println(F("  OVERLOAD ON|OFF"));
+  out.println(F("  REPLACE ON|OFF"));
+  out.println(F("  COMMLOST ON|OFF"));
+  out.println(F("  SHUTDOWN ON|OFF"));
+  out.println(F("  REPORT"));
+}
+
+bool requireArmed(Print &out) {
+  if (sim.armed) return true;
+  out.println(F("ERR simulator is not armed; use ARM ON"));
+  return false;
+}
+
+void applyBooleanCommand(Print &out, const char *arg, bool &target) {
+  bool value = false;
+  if (!parseOnOff(arg, value)) {
+    out.println(F("ERR expected ON or OFF"));
+    return;
+  }
+  target = value;
+  updateModel();
+  sendUsbReports(true);
+  out.println(F("OK"));
+}
+
+void handleCommand(char *line, Print &out) {
+  while (*line == ' ' || *line == '\t') ++line;
+  if (!*line) return;
+
+  char *save = NULL;
+  char *command = strtok_r(line, " \t", &save);
+  char *arg = strtok_r(NULL, " \t", &save);
+
+  if (!strcasecmp(command, "PING")) {
+    out.println(F("OK PONG"));
+    return;
+  }
+
+  if (!strcasecmp(command, "IDENT?")) {
+    out.println(F("OK NutUPS Ethernet HID UPS Simulator v1"));
+    return;
+  }
+
+  if (!strcasecmp(command, "HELP") || !strcmp(command, "?")) {
+    printHelp(out);
+    return;
+  }
+
+  if (!strcasecmp(command, "STATUS?") || !strcasecmp(command, "STATUS")) {
+    printStatus(out);
+    return;
+  }
+
+  if (!strcasecmp(command, "NETWORK?")) {
+    out.print(F("OK ip="));
+    out.print(Ethernet.localIP());
+    out.print(F(" gateway="));
+    out.print(Ethernet.gatewayIP());
+    out.print(F(" subnet="));
+    out.print(Ethernet.subnetMask());
+    out.print(F(" port="));
+    out.println(CONTROL_PORT);
+    return;
+  }
+
+  if (!strcasecmp(command, "ARM")) {
+    bool value = false;
+    if (!parseOnOff(arg, value)) {
+      out.println(F("ERR expected ARM ON or ARM OFF"));
+      return;
+    }
+    if (value) {
+      sim.armed = true;
+      out.println(F("OK armed"));
+    } else {
+      setSafeState();
+      updateModel();
+      sendUsbReports(true);
+      out.println(F("OK disarmed; safe online state restored"));
+    }
+    return;
+  }
+
+  if (!strcasecmp(command, "RESET")) {
+    setSafeState();
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK reset to safe online state; simulator disarmed"));
+    return;
+  }
+
+  if (!requireArmed(out)) return;
+
+  if (!strcasecmp(command, "REPORT")) {
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK"));
+    return;
+  }
+
+  if (!strcasecmp(command, "AC")) {
+    applyBooleanCommand(out, arg, sim.acPresent);
+    return;
+  }
+
+  if (!strcasecmp(command, "OVERLOAD")) {
+    applyBooleanCommand(out, arg, sim.overload);
+    return;
+  }
+
+  if (!strcasecmp(command, "REPLACE")) {
+    applyBooleanCommand(out, arg, sim.needReplacement);
+    return;
+  }
+
+  if (!strcasecmp(command, "COMMLOST")) {
+    applyBooleanCommand(out, arg, sim.communicationLost);
+    return;
+  }
+
+  if (!strcasecmp(command, "SHUTDOWN")) {
+    applyBooleanCommand(out, arg, sim.shutdownRequested);
+    return;
+  }
+
+  if (!strcasecmp(command, "CHARGING")) {
+    OverrideMode value;
+    if (!parseOverride(arg, value)) {
+      out.println(F("ERR expected AUTO, ON or OFF"));
+      return;
+    }
+    sim.charging = value;
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK"));
+    return;
+  }
+
+  if (!strcasecmp(command, "LOWBAT")) {
+    OverrideMode value;
+    if (!parseOverride(arg, value)) {
+      out.println(F("ERR expected AUTO, ON or OFF"));
+      return;
+    }
+    sim.lowBattery = value;
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK"));
+    return;
+  }
+
+  if (!strcasecmp(command, "BATTERY")) {
+    unsigned long value = 0;
+    if (!parseUnsigned(arg, 0, iFullChargeCapacity, value)) {
+      out.println(F("ERR expected BATTERY 0..100"));
+      return;
+    }
+    iRemaining = (byte)value;
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK"));
+    return;
+  }
+
+  if (!strcasecmp(command, "RUNTIME")) {
+    if (arg && !strcasecmp(arg, "AUTO")) {
+      sim.runtimeAuto = true;
+      updateModel();
+      sendUsbReports(true);
+      out.println(F("OK"));
+      return;
+    }
+
+    unsigned long value = 0;
+    if (!parseUnsigned(arg, 0, 65535UL, value)) {
+      out.println(F("ERR expected RUNTIME AUTO or 0..65535"));
+      return;
+    }
+    sim.runtimeAuto = false;
+    iRunTimeToEmpty = (uint16_t)value;
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK"));
+    return;
+  }
+
+  if (!strcasecmp(command, "VOLTAGE")) {
+    unsigned long value = 0;
+    if (!parseUnsigned(arg, 0, 65535UL, value)) {
+      out.println(F("ERR expected VOLTAGE 0..65535 centivolts"));
+      return;
+    }
+    iVoltage = (uint16_t)value;
+    updateModel();
+    sendUsbReports(true);
+    out.println(F("OK"));
+    return;
+  }
+
+  out.println(F("ERR unknown command; use HELP"));
+}
+
+void pollStream(Stream &input, Print &output, char *buffer, size_t &length, size_t capacity) {
+  while (input.available() > 0) {
+    const char c = (char)input.read();
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      buffer[length] = '\0';
+      handleCommand(buffer, output);
+      length = 0;
+      continue;
+    }
+
+    if (length + 1 < capacity) {
+      buffer[length++] = c;
+    } else {
+      length = 0;
+      output.println(F("ERR line too long"));
+    }
+  }
+}
+
+void initEthernet() {
+  // Ethernet Shield 2 SD-card chip select. Keep SD inactive.
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+
+  if (Ethernet.begin(macAddress) == 0) {
+    Ethernet.begin(macAddress, fallbackIp, fallbackDns, fallbackGateway, fallbackSubnet);
+  }
+
+  controlServer.begin();
+}
+
+void setupHid() {
+  PowerDevice.begin();
+  PowerDevice.setSerial(STRING_SERIAL);
+  PowerDevice.setOutput(Serial);
+
+  PowerDevice.setFeature(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
+  PowerDevice.setFeature(HID_PD_RUNTIMETOEMPTY, &iRunTimeToEmpty, sizeof(iRunTimeToEmpty));
+  PowerDevice.setFeature(HID_PD_AVERAGETIME2FULL, &iAvgTimeToFull, sizeof(iAvgTimeToFull));
+  PowerDevice.setFeature(HID_PD_AVERAGETIME2EMPTY, &iAvgTimeToEmpty, sizeof(iAvgTimeToEmpty));
+  PowerDevice.setFeature(HID_PD_REMAINTIMELIMIT, &iRemainTimeLimit, sizeof(iRemainTimeLimit));
+  PowerDevice.setFeature(HID_PD_DELAYBE4REBOOT, &iDelayBe4Reboot, sizeof(iDelayBe4Reboot));
+  PowerDevice.setFeature(HID_PD_DELAYBE4SHUTDOWN, &iDelayBe4ShutDown, sizeof(iDelayBe4ShutDown));
+
+  PowerDevice.setFeature(HID_PD_RECHARGEABLE, &bRechargable, sizeof(bRechargable));
+  PowerDevice.setFeature(HID_PD_CAPACITYMODE, &bCapacityMode, sizeof(bCapacityMode));
+  PowerDevice.setFeature(HID_PD_CONFIGVOLTAGE, &iConfigVoltage, sizeof(iConfigVoltage));
+  PowerDevice.setFeature(HID_PD_VOLTAGE, &iVoltage, sizeof(iVoltage));
+
+  PowerDevice.setStringFeature(HID_PD_IDEVICECHEMISTRY, &bDeviceChemistry, STRING_DEVICECHEMISTRY);
+  PowerDevice.setStringFeature(HID_PD_IOEMINFORMATION, &bOEMVendor, STRING_OEMVENDOR);
+
+  PowerDevice.setFeature(HID_PD_AUDIBLEALARMCTRL, &iAudibleAlarmCtrl, sizeof(iAudibleAlarmCtrl));
+  PowerDevice.setFeature(HID_PD_DESIGNCAPACITY, &iDesignCapacity, sizeof(iDesignCapacity));
+  PowerDevice.setFeature(HID_PD_FULLCHRGECAPACITY, &iFullChargeCapacity, sizeof(iFullChargeCapacity));
+  PowerDevice.setFeature(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
+  PowerDevice.setFeature(HID_PD_WARNCAPACITYLIMIT, &iWarnCapacityLimit, sizeof(iWarnCapacityLimit));
+  PowerDevice.setFeature(HID_PD_REMNCAPACITYLIMIT, &iRemnCapacityLimit, sizeof(iRemnCapacityLimit));
+  PowerDevice.setFeature(HID_PD_CPCTYGRANULARITY1, &bCapacityGranularity1, sizeof(bCapacityGranularity1));
+  PowerDevice.setFeature(HID_PD_CPCTYGRANULARITY2, &bCapacityGranularity2, sizeof(bCapacityGranularity2));
+
+  const uint16_t year = 2026;
+  const uint8_t month = 9;
+  const uint8_t day = 19;
+  iManufacturerDate = (year - 1980) * 512 + month * 32 + day;
+  PowerDevice.setFeature(HID_PD_MANUFACTUREDATE, &iManufacturerDate, sizeof(iManufacturerDate));
+}
+
+void setup() {
+  Serial.begin(UART_BAUD);
+  Serial1.begin(UART_BAUD);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  setSafeState();
+  setupHid();
+  initEthernet();
+
+  updateModel();
+  sendUsbReports(true);
+
+  Serial.print(F("NutUPS simulator control: "));
+  Serial.print(Ethernet.localIP());
+  Serial.print(':');
+  Serial.println(CONTROL_PORT);
+
+  Serial1.println(F("NutUPS simulator UART ready. Use HELP."));
+}
+
+void loop() {
+  Ethernet.maintain();
+
+  if (!controlClient || !controlClient.connected()) {
+    if (controlClient) controlClient.stop();
+
+    EthernetClient candidate = controlServer.available();
+    if (candidate) {
+      controlClient = candidate;
+      netLineLength = 0;
+      controlClient.println(F("OK NutUPS Ethernet HID UPS Simulator v1"));
+      controlClient.println(F("OK simulator starts DISARMED; use ARM ON before changing UPS state"));
+    }
+  }
+
+  if (controlClient && controlClient.connected()) {
+    pollStream(controlClient, controlClient, netLine, netLineLength, sizeof(netLine));
+  }
+
+  pollStream(Serial1, Serial1, uartLine, uartLineLength, sizeof(uartLine));
+
+  updateModel();
+  sendUsbReports(false);
+
+  const unsigned long now = millis();
+  if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = now;
+    heartbeatState = !heartbeatState;
+    digitalWrite(LED_BUILTIN, heartbeatState ? HIGH : LOW);
+  }
+}
