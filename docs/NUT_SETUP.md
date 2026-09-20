@@ -4,6 +4,16 @@ This guide connects the Arduino simulator's USB HID interface to Network UPS Too
 
 The simulator firmware is designed for NUT's `usbhid-ups` driver and the upstream Arduino HID subdriver used for the `HIDPowerDevice` implementation.
 
+## NUT version
+
+For the complete simulator variable set, use **NUT 2.8.5 or later**. The `arduino-hid` mappings for `ups.load`, `input.voltage`, and `output.voltage` first ship in NUT 2.8.5. Earlier 2.8.x releases can still use the core charge/runtime/status fields and startup delay, but those three measurements will be absent from `upsc`.
+
+Check the installed driver version with:
+
+```bash
+usbhid-ups -V
+```
+
 ## Safety warning
 
 A real NUT configuration may execute shutdown commands when it sees `OB`, `LB`, or shutdown-imminent states.
@@ -13,7 +23,10 @@ For first commissioning:
 - use a disposable/test host
 - disconnect production NUT clients
 - keep the simulator disarmed until read-only communication is verified
+- use the firmware arming lease instead of indefinite arming where possible
 - always finish state-injection tests with `RESET`
+
+The current firmware defaults `ARM ON` to a 120-second lease. Every command received while armed refreshes the lease. `ARM ON <seconds>` selects a different lease (`0..3600`); `0` explicitly disables lease expiry.
 
 ## 1. Install NUT
 
@@ -27,11 +40,11 @@ sudo apt install nut
 Confirm tools are present:
 
 ```bash
-usbhid-ups -h
+usbhid-ups -V
 upsc -V
 ```
 
-Package/service names can vary by distribution.
+Package/service names and packaged NUT versions vary by distribution.
 
 ## 2. Confirm USB enumeration
 
@@ -108,7 +121,7 @@ Once the driver and `upsd` are running:
 upsc nutups-sim@localhost
 ```
 
-A normal/reset state should include values similar to:
+A normal/reset state on NUT 2.8.5+ should include values similar to:
 
 ```text
 battery.charge: 100
@@ -120,6 +133,8 @@ output.voltage: 230.0
 ups.load: 25
 ups.status: OL
 ```
+
+On NUT 2.8.0-2.8.4, absence of `ups.load`, `input.voltage`, and `output.voltage` is expected and is not a simulator descriptor failure.
 
 Depending on NUT version and feature handling, delay values can also appear:
 
@@ -180,7 +195,7 @@ INPUTVOLTAGE 22850
 OUTPUTVOLTAGE 23010
 ```
 
-Expected values:
+On NUT 2.8.5+ expected values are:
 
 ```text
 ups.load: 65
@@ -210,6 +225,8 @@ These reflect the underlying HID feature storage. `STARTDELAY` provides an expli
 
 Because shutdown behavior can affect the real host, the simulator gates shutdown-request contribution behind its armed state.
 
+The delay values are currently stored values, not a complete countdown/output-power model. A realistic delayed output-off/start sequence remains a separate future feature.
+
 ## 9. Linux permissions
 
 If `usbhid-ups` sees the device as root but not under the normal NUT service account, investigate UDev permissions.
@@ -237,7 +254,7 @@ sudo usbhid-ups -DD -a nutups-sim
 Check:
 
 - actual USB VID/PID
-- NUT version
+- NUT version (`usbhid-ups -V`)
 - whether your NUT build includes the Arduino HID subdriver
 - whether a conflicting HID driver/process has claimed the interface
 - USB permissions
