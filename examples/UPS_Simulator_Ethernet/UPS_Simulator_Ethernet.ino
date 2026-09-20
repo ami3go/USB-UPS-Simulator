@@ -14,7 +14,8 @@
 #define DHCP_RESPONSE_TIMEOUT_MS 2000UL
 #define DHCP_MAINTAIN_INTERVAL_MS 1000UL
 #define DHCP_RETRY_INTERVAL_MS 60000UL
-#define ARM_LEASE_MS 120000UL
+#define ARM_DEFAULT_LEASE_SEC 120UL
+#define ARM_MAX_LEASE_SEC 3600UL
 
 HIDPowerDeviceNUT_ NutHidExtension;
 
@@ -90,35 +91,13 @@ unsigned long lastHeartbeatMs = 0;
 bool heartbeatState = false;
 bool dhcpLeased = false;
 unsigned long nextDhcpMaintainMs = 0;
+unsigned long armLeaseMs = 0;
 unsigned long lastCommandMs = 0;
 
 char netLine[96];
 size_t netLineLength = 0;
 char uartLine[96];
 size_t uartLineLength = 0;
-
-class BufferedPrint : public Print {
-public:
-  explicit BufferedPrint(Print &out) : out_(out), len_(0) {}
-  ~BufferedPrint() { drain(); }
-  using Print::write;
-
-  size_t write(uint8_t c) override {
-    buf_[len_++] = c;
-    if (len_ == sizeof(buf_)) drain();
-    return 1;
-  }
-
-  void drain() {
-    if (len_) out_.write(buf_, len_);
-    len_ = 0;
-  }
-
-private:
-  Print &out_;
-  uint8_t buf_[64];
-  uint8_t len_;
-};
 
 uint16_t atomicReadU16(const uint16_t &value) {
   uint16_t copy;
@@ -156,6 +135,7 @@ void setSafeState() {
   sim.runtimeAuto = true;
   sim.charging = OVERRIDE_AUTO;
   sim.lowBattery = OVERRIDE_AUTO;
+  armLeaseMs = 0;
   lastCommandMs = 0;
 
   iRemaining = 100;
@@ -365,6 +345,7 @@ void handleCommand(char *line, Print &out) {
   char *save = NULL;
   char *command = strtok_r(line, " \t", &save);
   char *arg = strtok_r(NULL, " \t", &save);
+  char *arg2 = strtok_r(NULL, " \t", &save);
 
   if (sim.armed) lastCommandMs = millis();
 
@@ -399,7 +380,13 @@ void handleCommand(char *line, Print &out) {
       return;
     }
     if (value) {
+      unsigned long leaseSec = ARM_DEFAULT_LEASE_SEC;
+      if (arg2 && !parseUnsigned(arg2, 0, ARM_MAX_LEASE_SEC, leaseSec)) {
+        out.println(F("ERR range"));
+        return;
+      }
       sim.armed = true;
+      armLeaseMs = leaseSec * 1000UL;
       lastCommandMs = millis();
       out.println(F("OK armed"));
     } else {
@@ -507,8 +494,7 @@ void pollStream(Stream &input, Print &output, char *buffer, size_t &length, size
     if (c == '\r') continue;
     if (c == '\n') {
       buffer[length] = '\0';
-      BufferedPrint reply(output);
-      handleCommand(buffer, reply);
+      handleCommand(buffer, output);
       length = 0;
       continue;
     }
@@ -596,7 +582,7 @@ void setup() {
 void loop() {
   const unsigned long now = millis();
 
-  if (sim.armed && (unsigned long)(now - lastCommandMs) >= ARM_LEASE_MS) {
+  if (sim.armed && armLeaseMs && (unsigned long)(now - lastCommandMs) >= armLeaseMs) {
     setSafeState();
     updateModel();
     sendUsbReports(true);
@@ -613,9 +599,8 @@ void loop() {
     if (controlClient) controlClient.stop();
     controlClient = candidate;
     netLineLength = 0;
-    BufferedPrint greeting(controlClient);
-    printIdent(greeting);
-    greeting.println(sim.armed ? F("OK ARMED") : F("OK DISARMED"));
+    printIdent(controlClient);
+    controlClient.println(sim.armed ? F("OK ARMED") : F("OK DISARMED"));
   } else if (controlClient && !controlClient.connected()) {
     controlClient.stop();
   }
