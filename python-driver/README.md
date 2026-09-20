@@ -1,85 +1,89 @@
 # NutUPS simulator Python driver user manual
 
-`nutups-simulator-control` is the host-side control library and CLI for the Arduino Leonardo + W5500 USB HID UPS simulator.
+`nutups-simulator-control` is the host-side API and CLI for the Arduino Leonardo + W5500 USB HID UPS simulator.
 
-The Python driver talks only to the simulator control interface. The machine under test continues to see the Leonardo as a USB HID UPS.
+The driver controls only the simulator's TCP/UART management interface. The system under test continues to see the Leonardo as a USB HID UPS.
 
 ## Requirements
 
-- Python **3.9 or newer**
-- TCP access to the W5500 simulator, or a UART adapter for `Serial1`
-- `pyserial` only when UART control is required
+- Python 3.9+
+- TCP access to W5500 port 5000, or a UART adapter connected to Leonardo `Serial1`
+- `pyserial` only for UART use
+- firmware identity `NutUPS HID Simulator v2`
 
-The CI test matrix covers Python 3.9 and 3.13.
+CI covers Python 3.9 and 3.13.
 
-## Installation
-
-### Recommended development install
+## Install
 
 From repository root:
 
 ```bash
 python -m venv .venv
-```
-
-Linux/macOS:
-
-```bash
 source .venv/bin/activate
+python -m pip install -e ./python-driver
 ```
 
 Windows PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
+python -m pip install -e .\python-driver
 ```
 
-Install:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install -e ./python-driver
-```
-
-The editable install provides both:
-
-```python
-from ups_simulator import UpsSimulator
-```
-
-and the CLI:
-
-```text
-ups-sim
-```
-
-### UART support
-
-Install the serial extra:
+UART extra:
 
 ```bash
 python -m pip install -e './python-driver[serial]'
 ```
 
-On PowerShell, quoting the same path is recommended:
+The install provides:
 
-```powershell
-python -m pip install -e '.\python-driver[serial]'
+```python
+from ups_simulator import UpsSimulator
 ```
 
-## First TCP test
+and:
 
 ```bash
-ups-sim --host 192.168.1.50 ping
-ups-sim --host 192.168.1.50 identify
-ups-sim --host 192.168.1.50 status
+ups-sim
 ```
 
-The default control port is 5000.
+## Connection behavior
 
-If DHCP failed, the firmware fallback address is `169.254.42.42/16`.
+### TCP
 
-## Basic Python usage
+```python
+ups = UpsSimulator.tcp("192.168.1.50", port=5000, timeout=2.0)
+```
+
+On connection the transport sends `PING` and reads until `OK PONG`. Any greeting/banner lines before that response are consumed and recorded. This works with both:
+
+- older firmware that emitted its greeting only after the first command arrived
+- hardened firmware that greets immediately on TCP accept
+
+`UpsSimulator.connect()` then sends `IDENT?` and requires exactly:
+
+```text
+NutUPS HID Simulator v2
+```
+
+A different firmware protocol version raises `ProtocolError` immediately rather than failing later while parsing `STATUS?`.
+
+### UART
+
+```python
+ups = UpsSimulator.serial("/dev/ttyUSB0", baudrate=115200, timeout=2.0)
+```
+
+Windows:
+
+```python
+ups = UpsSimulator.serial("COM5")
+```
+
+UART uses the same `PING` synchronization so a late `NutUPS ready` boot banner cannot be mistaken for a command response.
+
+## Basic read-only use
 
 ```python
 from ups_simulator import UpsSimulator
@@ -91,138 +95,20 @@ with UpsSimulator.tcp("192.168.1.50") as ups:
     print(ups.status())
 ```
 
-The context manager opens the transport on entry and closes it on exit.
+`status()` returns a frozen `SimulatorStatus` dataclass containing:
 
-## Safe test pattern
+- armed state
+- AC present
+- battery percentage
+- runtime and runtime mode
+- battery/input/output voltage
+- load percentage
+- charging/low-battery modes and effective states
+- overload/replacement/communication-loss/shutdown flags
+- start/shutdown/reboot delay values
+- current IP address
 
-For tests that can produce real NUT shutdown actions, use `armed_session()`:
-
-```python
-from ups_simulator import UpsSimulator
-
-with UpsSimulator.tcp("192.168.1.50") as ups:
-    with ups.armed_session():
-        ups.set_ac(False)
-        ups.set_battery(4)
-        ups.set_runtime(300)
-        print(ups.status())
-```
-
-`armed_session()` performs:
-
-```text
-ARM ON
-... test body ...
-RESET
-```
-
-The reset happens in a `finally` path, so it also runs when the test raises an exception.
-
-### Disarm instead of reset
-
-```python
-with ups.armed_session(reset_on_exit=False):
-    ...
-```
-
-exits using `ARM OFF`, which also restores the safe state. In normal automated tests the default reset behavior is recommended.
-
-## TCP constructor
-
-```python
-ups = UpsSimulator.tcp(
-    host="192.168.1.50",
-    port=5000,
-    timeout=2.0,
-)
-```
-
-Parameters:
-
-| Parameter | Default | Meaning |
-|---|---:|---|
-| `host` | required | Simulator IP/hostname. |
-| `port` | `5000` | W5500 control TCP port. |
-| `timeout` | `2.0` | Connect/read timeout in seconds. |
-
-The transport handles the two firmware greeting lines automatically, including the case where both arrive in one TCP packet.
-
-## UART constructor
-
-```python
-ups = UpsSimulator.serial(
-    port="/dev/ttyUSB0",
-    baudrate=115200,
-    timeout=2.0,
-)
-```
-
-Windows example:
-
-```python
-ups = UpsSimulator.serial("COM5")
-```
-
-Leonardo UART wiring uses hardware `Serial1` on D0/D1. See `docs/HARDWARE.md`.
-
-## Read-only API
-
-### `ping()`
-
-```python
-ups.ping() -> bool
-```
-
-Returns `True` for the expected `PONG` response.
-
-### `identify()`
-
-```python
-ups.identify() -> str
-```
-
-Current firmware returns identity similar to:
-
-```text
-NutUPS HID Simulator v2
-```
-
-### `status()`
-
-```python
-status = ups.status()
-```
-
-Returns a frozen `SimulatorStatus` dataclass.
-
-Fields:
-
-| Attribute | Type | Meaning |
-|---|---|---|
-| `armed` | `bool` | Whether mutation commands are enabled. |
-| `ac_present` | `bool` | Simulated AC state. |
-| `battery_percent` | `int` | Battery charge 0..100. |
-| `runtime_seconds` | `int` | Runtime-to-empty. |
-| `runtime_mode` | `str` | `auto` or `manual`. |
-| `voltage_centivolts` | `int` | Battery voltage raw value. |
-| `load_percent` | `int` | UPS load percentage. |
-| `input_voltage_centivolts` | `int` | Input voltage raw value. |
-| `output_voltage_centivolts` | `int` | Output voltage raw value. |
-| `charging_mode` | `str` | `auto`, `on`, or `off`. |
-| `charging_active` | `bool` | Effective charging status. |
-| `low_battery_mode` | `str` | `auto`, `on`, or `off`. |
-| `low_battery_active` | `bool` | Effective low-battery status. |
-| `overload` | `bool` | Overload flag. |
-| `need_replacement` | `bool` | Replace-battery flag. |
-| `communication_lost` | `bool` | HID CommunicationLost flag. |
-| `shutdown_requested` | `bool` | Explicit simulated shutdown request. |
-| `shutdown_imminent` | `bool` | Effective shutdown-imminent state. |
-| `host_start_delay` | `int` | HID startup delay. |
-| `host_shutdown_delay` | `int` | HID shutdown delay. |
-| `host_reboot_delay` | `int` | HID reboot delay. |
-| `ip` | `str` | Current simulator IP. |
-
-Convenience properties:
+Convenience properties convert centivolts to volts:
 
 ```python
 status.voltage_volts
@@ -230,219 +116,113 @@ status.input_voltage_volts
 status.output_voltage_volts
 ```
 
-return floating-point volts.
+`network_status()` returns `NetworkStatus(ip, gateway, subnet, port)`.
 
-### `network_status()`
+## Arming and the firmware lease
 
-```python
-network = ups.network_status()
-```
-
-Returns:
-
-```text
-NetworkStatus(ip, gateway, subnet, port)
-```
-
-## Safety/control API
-
-### `arm()`
+State-changing commands require the simulator to be armed.
 
 ```python
 ups.arm()
 ```
 
-Equivalent to `ARM ON`.
+sends `ARM ON`, which uses the firmware default **120-second lease**.
 
-### `disarm()`
+Use an explicit lease when needed:
 
 ```python
+ups.arm(lease_seconds=300)
+```
+
+Valid explicit range is `0..3600` seconds. `0` intentionally disables lease expiry.
+
+While the simulator is armed, every command received by the firmware refreshes the lease. If a non-zero lease expires, the firmware automatically restores the safe online state even if the Python process was killed or the network disappeared.
+
+### Recommended safe context
+
+```python
+with UpsSimulator.tcp("192.168.1.50") as ups:
+    with ups.armed_session(lease_seconds=120):
+        ups.set_ac(False)
+        ups.set_battery(4)
+        ups.set_runtime(300)
+        print(ups.status())
+```
+
+`armed_session()` attempts `RESET` on exit. If the test body raises and cleanup also fails, the original test exception is preserved and the cleanup failure is emitted as a `RuntimeWarning` instead of masking the original failure.
+
+To use `ARM OFF` rather than `RESET` on normal exit:
+
+```python
+with ups.armed_session(reset_on_exit=False):
+    ...
+```
+
+The firmware lease remains the final fail-safe for process death, `kill -9`, or network loss.
+
+## Control API
+
+```python
+ups.arm()
+ups.arm(lease_seconds=300)
 ups.disarm()
-```
-
-Equivalent to `ARM OFF`; the firmware restores the safe state.
-
-### `reset()`
-
-```python
 ups.reset()
-```
+ups.report()                       # allowed while disarmed
 
-Restores safe defaults and disarms the simulator.
+ups.set_ac(False)
+ups.set_battery(75)                # 0..100
+ups.set_load(50)                   # 0..100
+ups.set_runtime(1200)              # 0..65535 seconds
+ups.set_runtime(None)              # AUTO
 
-### `report()`
-
-```python
-ups.report()
-```
-
-Forces an immediate HID report update.
-
-## Measurement/state API
-
-### AC
-
-```python
-ups.set_ac(False)   # simulate mains failure
-ups.set_ac(True)    # simulate mains restored
-```
-
-### Battery charge
-
-```python
-ups.set_battery(75)
-```
-
-Valid range: `0..100`.
-
-### UPS load
-
-```python
-ups.set_load(65)
-```
-
-Valid range: `0..100` percent.
-
-### Runtime
-
-Manual:
-
-```python
-ups.set_runtime(1200)
-```
-
-Automatic:
-
-```python
-ups.set_runtime(None)
-```
-
-Manual range: `0..65535` seconds.
-
-### Battery voltage
-
-Use volts:
-
-```python
 ups.set_voltage(13.2)
-```
-
-or raw centivolts:
-
-```python
 ups.set_voltage_centivolts(1320)
-```
+ups.set_input_voltage(230.0)
+ups.set_output_voltage(229.5)
 
-### Input voltage
-
-```python
-ups.set_input_voltage(228.5)
-```
-
-or:
-
-```python
-ups.set_input_voltage_centivolts(22850)
-```
-
-### Output voltage
-
-```python
-ups.set_output_voltage(230.1)
-```
-
-or:
-
-```python
-ups.set_output_voltage_centivolts(23010)
-```
-
-Voltage helper range is 0..655.35 V because the underlying HID value is an unsigned 16-bit centivolt field.
-
-### Startup delay
-
-```python
-ups.set_start_delay(30)
-```
-
-Valid range: `-1..32767` seconds. `-1` represents no pending startup delay.
-
-## Mode/flag API
-
-### Charging
-
-```python
-ups.set_charging("auto")
-ups.set_charging("on")
-ups.set_charging("off")
-```
-
-Booleans are also accepted:
-
-```python
-ups.set_charging(True)
-ups.set_charging(False)
-```
-
-### Low battery
-
-```python
+ups.set_start_delay(30)            # -1..32767
+ups.set_charging("auto")           # auto/on/off or bool
 ups.set_low_battery("auto")
-ups.set_low_battery(True)
-ups.set_low_battery(False)
-```
-
-### Fault/status flags
-
-```python
 ups.set_overload(True)
 ups.set_need_replacement(True)
 ups.set_communication_lost(True)
 ups.set_shutdown_requested(True)
 ```
 
-Remember that `set_communication_lost(True)` only sets the HID flag. It does not physically interrupt USB and is not equivalent to guaranteed NUT `NOCOMM`.
+Voltage helper methods accept volts; raw `*_centivolts()` methods accept `0..65535`, corresponding to 0..655.35 V.
 
-## Complete automation example
+`set_communication_lost(True)` only sets the HID `CommunicationLost` status bit. It does not physically interrupt USB and is not guaranteed to produce NUT driver-level `NOCOMM`.
+
+## Complete example
 
 ```python
 from ups_simulator import UpsSimulator
 
-SIMULATOR = "192.168.1.50"
-
-with UpsSimulator.tcp(SIMULATOR) as ups:
+with UpsSimulator.tcp("192.168.1.50") as ups:
     print("initial:", ups.status())
 
-    with ups.armed_session():
-        # Normal loaded UPS
+    with ups.armed_session(lease_seconds=120):
         ups.set_load(55)
         ups.set_input_voltage(230.0)
         ups.set_output_voltage(230.0)
 
-        # Mains failure
         ups.set_ac(False)
         ups.set_battery(70)
         print("on battery:", ups.status())
 
-        # Approach shutdown condition
         ups.set_battery(4)
         ups.set_runtime(300)
         print("low battery:", ups.status())
 
-        # Restore mains before context exits
         ups.set_ac(True)
         ups.set_battery(45)
         ups.set_runtime(None)
         ups.set_low_battery("auto")
         ups.set_charging("auto")
         print("restored:", ups.status())
-
-# RESET has run here.
 ```
 
-## Exception handling
-
-Public exception hierarchy:
+## Exception hierarchy
 
 ```text
 SimulatorError
@@ -451,48 +231,35 @@ SimulatorError
 └── CommandError
 ```
 
+- `TransportError`: TCP/UART connection or I/O failure
+- `ProtocolError`: framing, malformed response, missing fields, or unsupported firmware identity
+- `CommandError`: firmware returned `ERR ...`
+- `ValueError`: local invalid API argument
+
 Example:
 
 ```python
-from ups_simulator import (
-    UpsSimulator,
-    SimulatorError,
-    CommandError,
-)
+from ups_simulator import UpsSimulator, SimulatorError, CommandError
 
 try:
     with UpsSimulator.tcp("192.168.1.50") as ups:
-        ups.arm()
-        ups.set_battery(40)
+        with ups.armed_session():
+            ups.set_battery(4)
 except CommandError as exc:
     print("firmware rejected command:", exc)
 except SimulatorError as exc:
     print("transport/protocol failure:", exc)
 ```
 
-High-level setters also raise `ValueError` locally for invalid ranges before a command is sent.
+## CLI
 
-## Raw command access
-
-For protocol features not yet wrapped by a high-level method:
-
-```python
-payload = ups.raw_command("STATUS?")
-```
-
-`raw_command()` removes the leading `OK` and converts `ERR` replies to `CommandError`.
-
-`HELP`/`?` are intentionally rejected by `raw_command()` because they are conceptually multi-line commands in older firmware variants and are not suitable for the single-response abstraction.
-
-## CLI reference
-
-General syntax:
+General form:
 
 ```text
 ups-sim (--host HOST | --serial PORT) [global options] COMMAND [arguments]
 ```
 
-Global options:
+Connection options:
 
 ```text
 --host HOST
@@ -502,7 +269,7 @@ Global options:
 --timeout 2.0
 ```
 
-### Read-only
+Read-only examples:
 
 ```bash
 ups-sim --host 192.168.1.50 ping
@@ -511,18 +278,20 @@ ups-sim --host 192.168.1.50 status
 ups-sim --host 192.168.1.50 network
 ```
 
-`status` and `network` print JSON.
+`ping` returns a non-zero exit code if the response is not `PONG`. `status` and `network` print JSON.
 
-### Safety
+Safety:
 
 ```bash
 ups-sim --host 192.168.1.50 arm
+ups-sim --host 192.168.1.50 arm --lease 300
+ups-sim --host 192.168.1.50 arm --lease 0
 ups-sim --host 192.168.1.50 disarm
 ups-sim --host 192.168.1.50 reset
 ups-sim --host 192.168.1.50 report
 ```
 
-### Measurements
+Measurements and faults:
 
 ```bash
 ups-sim --host 192.168.1.50 ac off
@@ -534,11 +303,6 @@ ups-sim --host 192.168.1.50 voltage 13.2
 ups-sim --host 192.168.1.50 input-voltage 228.5
 ups-sim --host 192.168.1.50 output-voltage 230.1
 ups-sim --host 192.168.1.50 start-delay 30
-```
-
-### Modes/faults
-
-```bash
 ups-sim --host 192.168.1.50 charging auto
 ups-sim --host 192.168.1.50 lowbat auto
 ups-sim --host 192.168.1.50 overload on
@@ -547,22 +311,20 @@ ups-sim --host 192.168.1.50 commlost on
 ups-sim --host 192.168.1.50 shutdown on
 ```
 
-### UART examples
+UART:
 
 ```bash
 ups-sim --serial /dev/ttyUSB0 status
 ups-sim --serial COM5 ping
 ```
 
-### Raw CLI command
+Raw single-line command:
 
 ```bash
 ups-sim --host 192.168.1.50 raw STATUS?
 ```
 
-## Testing the Python package
-
-From repository root after installation:
+## Tests
 
 ```bash
 python -m unittest discover -s python-driver/tests -v
@@ -570,57 +332,29 @@ python -m unittest discover -s python-driver/tests -v
 
 Tests cover:
 
-- status parsing
-- network parsing
-- command generation
-- numeric range validation
-- firmware error conversion
-- safe reset after exceptions
-- TCP handling when both startup greeting lines arrive in one packet
+- status/network parsing
+- command generation and argument validation
+- firmware `ERR` conversion
+- v2 firmware identity check
+- TCP greeting sent immediately and delayed-until-first-command
+- UART late boot banner synchronization
+- CLI ping failure exit status
+- cleanup failure without masking the original test exception
+- safe reset after exception
+
+The workflow runs for Python 3.9 and 3.13 and is also triggered by firmware/HID/protocol changes so host and firmware behavior cannot silently drift apart.
+
+## Security
+
+TCP/5000 has no authentication or encryption. The ARM gate and lease are safety mechanisms, not authentication.
+
+Use a direct link, dedicated management/test VLAN, or firewall rules to restrict raw TCP/5000 access. Authentication only in the Python/Cockpit layer cannot prevent another reachable host from bypassing that layer and connecting directly to the Arduino.
 
 ## NUT integration
 
-The Python driver controls the simulator; it does not replace NUT.
-
-A typical automated integration test is:
-
-```text
-Python driver -> W5500 -> simulator state
-                         |
-                         v
-                    USB HID reports
-                         |
-                         v
-                       NUT
-                         |
-                         v
-                query/assert with upsc
-```
-
-See:
+The Python driver controls the simulator; it does not replace NUT. For NUT setup and variable mappings see:
 
 - [`docs/NUT_SETUP.md`](../docs/NUT_SETUP.md)
 - [`docs/NUT_VARIABLES.md`](../docs/NUT_VARIABLES.md)
 
-## Security
-
-The firmware TCP protocol has no authentication or encryption.
-
-Use it only on a trusted management/test network or protect it with external network controls. `ARM ON` is a safety guard, not an authentication method.
-
-## Recommended feature placement
-
-Because the Leonardo firmware is at approximately 97% flash, implement future capabilities such as these in Python/Cockpit:
-
-- scenario files
-- battery drain/charge simulation over time
-- scheduled events
-- retries and reconnect logic
-- persistent configuration
-- authentication
-- dashboards
-- NUT assertions
-- test reports
-- Synology/NAS integration workflows
-
-Keep the AVR side focused on USB HID reporting and a small deterministic control protocol.
+`ups.load`, `input.voltage` and `output.voltage` require NUT 2.8.5+.
