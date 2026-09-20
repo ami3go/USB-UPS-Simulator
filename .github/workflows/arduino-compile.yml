@@ -32,10 +32,13 @@ jobs:
 
       - name: Compile Ethernet simulator for Leonardo and enforce flash budget
         run: |
-          set -o pipefail
+          set +e
           out=$(arduino-cli compile --warnings all --fqbn arduino:avr:leonardo \
             "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet" 2>&1)
+          rc=$?
+          set -e
           echo "$out"
+          test "$rc" -eq 0
           used=$(printf '%s\n' "$out" | sed -n 's/^Sketch uses \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)
           test -n "$used"
           test "$used" -le 28160
