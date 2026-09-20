@@ -7,6 +7,7 @@ This directory contains the complete user and developer documentation for the Ar
 | Guide | Purpose |
 |---|---|
 | [Quick start and flashing](FLASHING.md) | Assemble the hardware, install Arduino tools, build, flash, and run the first simulator test. |
+| [Hardware self-test](SELF_TEST.md) | Detect the USB HID UPS and Ethernet simulator from one PC, then verify the complete v2 command set safely. |
 | [Hardware guide](HARDWARE.md) | Leonardo/W5500 compatibility, pin usage, USB/UART/Ethernet wiring, and power recommendations. |
 | [Control protocol](CONTROL_PROTOCOL.md) | Complete TCP/UART command reference, status fields, units, responses, and test sequences. |
 | [Python driver manual](../python-driver/README.md) | Install and use the `ups_simulator` Python API and `ups-sim` CLI. |
@@ -44,15 +45,15 @@ The USB connection is the simulated UPS interface. Ethernet and UART are control
 
 ## Safety principle
 
-The simulator boots **disarmed** and in a safe online state. Commands that modify the simulated UPS require `ARM ON`. `RESET` and `ARM OFF` restore the safe state.
+The simulator boots **disarmed** and in a safe online state. Commands that modify the simulated UPS require `ARM ON`. `RESET` and `ARM OFF` restore the safe state. The firmware also applies a default arming lease so a lost controller cannot leave injected fault state armed indefinitely.
 
-This matters because a low-battery or shutdown-imminent condition can cause a real NUT installation to shut down physical machines.
+This matters because a low-battery or shutdown-imminent condition can cause a real NUT installation to shut down physical machines. The hardware self-test therefore refuses its OB/LB/shutdown checks when it detects a live `upsmon`, unless the operator explicitly overrides that guard.
 
 ## Current Leonardo resource usage
 
-The current Ethernet simulator build uses approximately:
+The pinned reference build uses:
 
-- flash: **28,070 / 28,672 bytes (97%)**
-- static RAM: **1,296 / 2,560 bytes (50%)**
+- flash: **27,854 / 28,672 bytes (97%)**
+- static RAM: **1,321 / 2,560 bytes (51%)**
 
-The AVR firmware should therefore be treated as effectively feature-frozen. New automation, scenarios, authentication, web UI, logging, and orchestration should normally be implemented in the Python/Cockpit side rather than added to the Leonardo image.
+The AVR firmware should therefore be treated as effectively feature-frozen. New automation, scenarios, authentication, web UI, logging, orchestration, and test tooling should normally be implemented in the Python/Cockpit side rather than added to the Leonardo image.

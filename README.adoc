@@ -40,6 +40,7 @@ The reference firmware runs on Arduino Leonardo/ATmega32U4, presents a USB HID P
 * atomic handling of AVR state shared with USB control requests
 * read-only HID Feature locking
 * Python API and `ups-sim` CLI with protocol synchronization/version checks
+* host-side `ups-sim-selftest` for USB HID + LAN discovery + command verification
 * pinned Arduino toolchain and flash-budget CI
 
 == Supported reference hardware
@@ -190,7 +191,26 @@ ups-sim --host 192.168.1.50 battery 40
 ups-sim --host 192.168.1.50 reset
 ----
 
-See link:python-driver/README.md[the Python driver manual].
+=== Hardware self-test
+
+With Leonardo connected to the PC by USB and W5500 connected to the same LAN:
+
+[source,shell]
+----
+python -m pip install -e './python-driver[selftest]'
+ups-sim-selftest
+----
+
+The tool verifies the USB HID Power Device, discovers the Ethernet simulator, checks the disarmed safety gate, exercises the complete v2 command set with read-back validation, and always attempts a final `RESET`. It refuses the OB/LB/shutdown-state portion if it detects a live `upsmon`, unless explicitly overridden.
+
+If the IP is known:
+
+[source,shell]
+----
+ups-sim-selftest --host 192.168.1.50
+----
+
+See link:docs/SELF_TEST.md[the hardware self-test guide] and link:python-driver/README.md[the Python driver manual].
 
 == NUT support
 
@@ -227,9 +247,10 @@ If the NUT host may power down, independently power Leonardo + W5500 through a s
 |Guide |Purpose
 |link:docs/README.md[Documentation index] |All guides
 |link:docs/FLASHING.md[Flashing] |IDE/CLI install, upload and recovery
+|link:docs/SELF_TEST.md[Hardware self-test] |USB HID detection, LAN discovery and complete protocol verification
 |link:docs/HARDWARE.md[Hardware] |W5500, pinout, UART and power
 |link:docs/CONTROL_PROTOCOL.md[Control protocol] |TCP/UART commands and arming lease
-|link:python-driver/README.md[Python driver] |API, CLI, exceptions and synchronization
+|link:python-driver/README.md[Python driver] |API, CLI, self-test, exceptions and synchronization
 |link:docs/NUT_SETUP.md[NUT setup] |`usbhid-ups` setup and verification
 |link:docs/NUT_VARIABLES.md[NUT variables] |HID-to-NUT mapping and version support
 |link:docs/PROGRAMMING_GUIDE.md[Programming guide] |HID architecture, atomicity and development rules
@@ -273,7 +294,7 @@ GitHub Actions:
 
 == Hardware validation
 
-CI and emulation do not replace real hardware checks. Before a release, verify Leonardo + W5500 startup/fallback timing, NUT state across MCU reset, NUT 2.8.5+ extended variables, stale-controller takeover, and (if relevant) Windows enumeration as a single UPS/battery device.
+CI and emulation do not replace real hardware checks. Before a release, verify Leonardo + W5500 startup/fallback timing, NUT state across MCU reset, NUT 2.8.5+ extended variables, stale-controller takeover, and (if relevant) Windows enumeration as a single UPS/battery device. `ups-sim-selftest` automates the USB discovery and command-path portion of this validation.
 
 == License
 

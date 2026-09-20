@@ -17,9 +17,11 @@ classifiers = [
 
 [project.optional-dependencies]
 serial = ["pyserial>=3.5"]
+selftest = ["psutil>=5.9", "pyusb>=1.2"]
 
 [project.scripts]
 ups-sim = "ups_simulator.cli:main"
+ups-sim-selftest = "ups_simulator.selftest:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
