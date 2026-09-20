@@ -2,98 +2,102 @@
 
 ## Build says the sketch is too large
 
-The reference Ethernet/NUT simulator is already close to the Leonardo limit:
+Pinned reference build:
 
 ```text
-28070 / 28672 bytes flash (97%)
+Ethernet/NUT simulator: 27854 / 28672 bytes flash, 1321 / 2560 bytes RAM
 ```
 
-If your build exceeds flash:
+CI rejects simulator builds above 28,160 bytes to preserve at least 512 bytes of flash for reliability fixes.
 
-1. Confirm board target is `arduino:avr:leonardo`.
-2. Use the reference Arduino AVR core and Ethernet library versions if possible.
-3. Check whether local edits added strings, libraries, or debug code.
-4. Avoid adding HTTP, JSON, TLS, web UI, or scenario logic to the AVR firmware.
-5. Move new functionality into the Python/Cockpit side.
+If your build exceeds the limit:
 
-The original minimal `examples/UPS` sketch should remain much smaller.
+1. target `arduino:avr:leonardo`
+2. use Arduino AVR core `1.8.8`
+3. use Ethernet library `2.0.2`
+4. check local strings/debug libraries
+5. keep web/TLS/scenario/persistence features on Python/Cockpit
 
 ## Upload port disappears or changes
 
-Leonardo uses native USB and the bootloader can enumerate differently from the application.
+Leonardo uses native USB and the bootloader may enumerate on a different port.
 
-Try:
-
-1. Press reset twice quickly to enter the bootloader.
+1. Press reset twice quickly.
 2. Run `arduino-cli board list` repeatedly.
 3. Select the temporary bootloader port.
 4. Upload immediately.
-5. Temporarily remove the Ethernet shield if you suspect hardware interference.
+5. Remove the Ethernet shield temporarily if hardware interference is suspected.
 
-Linux helper:
+## W5500 does not work on Leonardo
 
-```bash
-watch -n 0.2 'arduino-cli board list'
-```
+The shield must use the Leonardo **2x3 ICSP connector** for SPI. Check:
 
-## W5500 shield does not work on Leonardo
-
-Check the **2x3 ICSP connector** on the shield.
-
-Leonardo SPI is on ICSP, not UNO D11/D12/D13. A W5500 shield without ICSP pass-through may stack physically but fail electrically.
-
-Also verify:
-
-- D10 is not reused by other hardware
-- D4 is not pulled low by an SD card or other device
-- Ethernet cable/link LEDs are active
-- the Ethernet library is installed
+- ICSP socket physically populated/mated
+- D10 free for W5500 CS
+- D4 held HIGH / SD unused during commissioning
+- Ethernet link LEDs
+- Ethernet 2.0.2 installed for the reference build
 
 ## No DHCP address
 
-The simulator falls back to:
+The hardened firmware waits a bounded time for DHCP and then uses:
 
 ```text
 169.254.42.42/16
+TCP 5000
 ```
 
-If DHCP fails:
-
-1. Check link LEDs and cable.
-2. Check your DHCP server/router lease table.
-3. Put the control PC on a compatible `169.254.x.x/16` address if necessary.
-4. Test:
+Test:
 
 ```bash
 ping 169.254.42.42
 nc 169.254.42.42 5000
 ```
 
-If several simulators use the same default MAC address, change the final MAC bytes in firmware.
+Only a real DHCP lease is maintained later. DHCP maintenance is postponed while armed so a failed renewal cannot stall a fault-injection sequence.
 
-## TCP connection works but commands return `ERR disarmed`
+## TCP greeting or first command looks wrong
 
-This is expected after boot/reset.
+Current firmware greets immediately when a client connects:
 
-Run:
+```text
+OK NutUPS HID Simulator v2
+OK DISARMED
+```
+
+or `OK ARMED` when already armed.
+
+The current Python driver also sends `PING` during connect and reads through `OK PONG`, so it works with older firmware that emitted its greeting only after the first command.
+
+If a custom client is used, do not assume a fixed timing window; frame replies by lines and account for the two greeting lines.
+
+## A second TCP client disconnects the first one
+
+Intentional. The newest TCP connection takes over the simulator. This is the recovery mechanism for stale/half-open W5500 sessions.
+
+Do not run two independent controllers simultaneously unless takeover is intended.
+
+## Commands return `ERR disarmed`
+
+Expected after boot/reset or after an arming lease expires.
 
 ```text
 ARM ON
 ```
 
-Then issue state-changing commands.
-
-Finish with:
+uses the default 120-second lease. Every command refreshes it.
 
 ```text
-RESET
+ARM ON 300
 ```
 
-## `HELP` does not list every command
+selects a 300-second lease. `ARM ON 0` explicitly disables lease expiry.
 
-Intentional. The firmware keeps help/error strings very small to save flash.
+If the controller crashes and stops sending commands, a non-zero lease automatically restores the safe state.
 
-Use [CONTROL_PROTOCOL.md](CONTROL_PROTOCOL.md) as the authoritative command reference.
+## `REPORT` returns `ERR disarmed`
+
+Update the firmware. Hardened firmware permits `REPORT` while disarmed because it only re-sends the current state.
 
 ## NUT does not detect the Arduino
 
@@ -101,71 +105,62 @@ Start with:
 
 ```bash
 lsusb
+usbhid-ups -V
 sudo usbhid-ups -DD -a nutups-sim
 ```
 
-Check:
-
-- USB cable supports data, not power only
-- board application is running, not stuck in bootloader
-- `ups.conf` uses `driver = usbhid-ups`
-- actual USB VID/PID
-- NUT build includes Arduino HID support
-- UDev/USB permissions
-- no other process has claimed the HID interface
-
-See [NUT_SETUP.md](NUT_SETUP.md).
+Check USB data cable, VID/PID, `driver = usbhid-ups`, permissions, and whether another process has claimed the HID interface.
 
 ## `ups.load`, `input.voltage`, or `output.voltage` is missing
 
-These fields require the NUT extension descriptor in the current Ethernet simulator.
+These variables require **NUT 2.8.5 or later**.
 
-Check that you flashed:
+First check:
+
+```bash
+usbhid-ups -V
+```
+
+NUT 2.8.0-2.8.4 can use the core Arduino HID variables but does not map these three fields.
+
+Also verify that you flashed:
 
 ```text
 examples/UPS_Simulator_Ethernet/UPS_Simulator_Ethernet.ino
 ```
 
-and not the older/minimal:
-
-```text
-examples/UPS/UPS.ino
-```
-
-Then verify the firmware identity:
+and that:
 
 ```text
 IDENT?
 ```
 
-Expected current simulator identity:
+returns:
 
 ```text
 OK NutUPS HID Simulator v2
 ```
 
-If the fields are still absent, run `usbhid-ups -DD` and inspect the detected HID paths/NUT version.
+## `input.voltage` specifically is missing on NUT 2.8.5+
 
-## `input.voltage` specifically is missing
-
-The expected NUT path is:
+The required path is:
 
 ```text
 UPS.PowerConverter.Input.[1].Voltage
 ```
 
-The firmware generates this using the indexed HID Input collection in `HIDPowerDeviceNUT.cpp`. If you modified that descriptor, verify the collection remains indexed as required by the NUT HID parser.
+The descriptor uses an indexed collection (`0x81`) to create `[1]`. Descriptor edits that remove that indexed collection can make the field disappear even though the firmware still compiles.
 
 ## NUT reports the wrong voltage scale
 
-The simulator wire protocol stores voltage in centivolts:
+The raw control protocol uses centivolts:
 
 ```text
 1300  = 13.00 V
 23000 = 230.00 V
 ```
 
-When using the Python API, call the volt-based methods instead of sending raw centivolts:
+The Python API accepts volts:
 
 ```python
 ups.set_voltage(13.2)
@@ -173,11 +168,15 @@ ups.set_input_voltage(230.0)
 ups.set_output_voltage(229.5)
 ```
 
+## NUT briefly reports OB/RB when the simulator resets
+
+That was a pre-hardening startup bug. Current firmware computes its safe `PresentStatus` before starting Ethernet/DHCP. Reflash the current firmware and retest while watching NUT logs.
+
+If a transient remains on real hardware, capture `usbhid-ups -DD` output during reset; hardware timing still needs validation.
+
 ## Low battery does not appear
 
-With `LOWBAT AUTO`, low battery activates at or below the configured 5% charge limit.
-
-Example:
+With `LOWBAT AUTO`, low battery activates at or below 5% by default:
 
 ```text
 ARM ON
@@ -186,127 +185,90 @@ BATTERY 4
 STATUS?
 ```
 
-You can force the flag independently with:
-
-```text
-LOWBAT ON
-```
+Force independently with `LOWBAT ON`.
 
 ## Charging does not appear
 
-Default `CHARGING AUTO` requires:
-
-- AC present
-- battery below 100%
-
-Example:
+`CHARGING AUTO` needs AC present and battery below 100%:
 
 ```text
 ARM ON
 AC ON
 BATTERY 50
 CHARGING AUTO
-STATUS?
 ```
 
-Or force it:
+## `COMMLOST ON` does not produce `NOCOMM`
+
+Expected. It sets the HID `CommunicationLost` bit; it does not detach USB. Real NUT transport-loss testing requires actually interrupting USB/driver communication.
+
+## Python reports an unsupported firmware
+
+The hardened Python driver verifies:
 
 ```text
-CHARGING ON
+NutUPS HID Simulator v2
 ```
 
-## `COMMLOST ON` does not make NUT say `NOCOMM`
+on connect. Flash matching v2 firmware or use a driver version compatible with your firmware protocol.
 
-Expected limitation.
+## Python TCP cannot connect
 
-`COMMLOST ON` sets the HID `CommunicationLost` status bit. It does not physically break USB transport.
-
-For driver-level `NOCOMM` testing, genuinely interrupt USB/driver communication using a separate test method.
-
-## Python driver cannot connect over TCP
-
-Check raw transport first:
+Check raw access:
 
 ```bash
 nc <simulator-ip> 5000
 ```
 
-Then:
+A new client takes over from a stale one, so power cycling should no longer be necessary merely to recover a half-open control socket.
 
-```text
-PING
-```
+Check VLAN/firewall rules as well. TCP/5000 is intentionally unauthenticated and should only be reachable from trusted test controllers.
 
-If raw TCP works but Python does not:
-
-```bash
-ups-sim --host <simulator-ip> --timeout 5 status
-```
-
-Check firewalls and whether another control client is already holding the simulator's single TCP connection.
-
-## Python UART driver fails to import `serial`
-
-Install the optional dependency:
+## Python UART fails to import `serial`
 
 ```bash
 python -m pip install -e './python-driver[serial]'
 ```
 
-or:
+or install `pyserial` directly.
 
-```bash
-python -m pip install pyserial
-```
+## UART reply is shifted by `NutUPS ready`
 
-## UART gives no response
+Use the current Python driver. It synchronizes UART with `PING`, consuming late boot/banner lines before normal commands.
 
-Verify:
+UART wiring is Leonardo D1 -> adapter RX, D0 <- adapter TX, plus common GND at 115200 8N1.
 
-```text
-baud: 115200
-TX Leonardo D1 -> adapter RX
-RX Leonardo D0 -> adapter TX
-GND -> GND
-```
+## `armed_session()` masks my test exception
 
-Use TTL-compatible logic levels, not RS-232 voltage levels.
+Update the Python driver. Current behavior preserves the original test exception. If cleanup fails because the connection is gone, cleanup failure is emitted as `RuntimeWarning`.
 
-## Python `armed_session()` resets state unexpectedly
+The firmware lease is still the final safety mechanism if the process is killed outright.
 
-That is its safety behavior.
+## Host-written delay timers do not count down
 
-```python
-with ups.armed_session():
-    ...
-```
-
-calls `RESET` when leaving the context, including after exceptions.
-
-For special test cases that intentionally need the state preserved, inspect/use the `reset_on_exit` option deliberately and restore the safe state yourself afterward.
-
-## Host shuts down during testing
-
-The simulator is doing what it was designed to do: NUT may react to `OB`, `LB`, or shutdown-imminent states.
-
-Before running aggressive scenarios:
-
-- isolate the NUT test environment
-- disconnect production clients
-- disable real shutdown actions if appropriate for the test stage
-- keep a second management machine available
-- use `RESET` immediately after the required observation
+Current limitation. `DelayBeforeStartup`, `DelayBeforeShutdown`, and `DelayBeforeReboot` are HID storage values, not yet a full output-power countdown model. A realistic delayed output-off/start state machine is planned as a separate feature rather than being hidden inside this hardening change.
 
 ## Simulator disappears when the NUT host powers off
 
-The Leonardo was probably powered only from the host USB port.
+The Leonardo was likely powered only by USB. For full shutdown/recovery tests, independently power Leonardo + W5500 through a supported external-power input.
 
-For full-cycle shutdown tests, independently power the Leonardo through a supported external-power input so the W5500 remains reachable after the host shuts down.
+## Multiple simulators conflict
 
-## Ethernet simulator resets to online/100% after MCU reboot
+MAC and USB serial are currently compile-time defaults. Multiple boards on one LAN/host need unique identities. A unified simulator-ID mechanism is not implemented yet.
 
-Intentional. Simulator state is not persisted. Every MCU restart returns to the disarmed safe state to prevent stale fault conditions from causing unintended shutdowns after a power interruption.
+## Security concern: raw TCP/5000
 
-## CI fails after documentation-only changes
+There is no protocol authentication. Python/Cockpit authentication cannot secure the raw Arduino listener because a reachable host can bypass those clients.
 
-Documentation changes should not alter firmware output, but repository CI still compiles the Arduino examples and runs Python tests. Inspect the Actions logs for whether the failure is environmental or caused by an accidental source change.
+Use a point-to-point control link, dedicated management/test VLAN, or firewall rules restricting TCP/5000.
+
+## CI fails after a firmware/HID change
+
+Current CI pins the reference toolchain, enables warnings, compiles both Leonardo sketches, runs Python 3.9/3.13 tests when the firmware/protocol changes, and enforces the 28,160-byte simulator flash budget.
+
+Inspect whether the failure is:
+
+- actual compiler error
+- simulator over the flash budget
+- host/firmware protocol-test mismatch
+- upstream Arduino-core warning versus repository warning

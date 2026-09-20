@@ -2,23 +2,21 @@
 
 This guide is for developers modifying the Arduino firmware or extending its NUT/HID behavior.
 
-## Design goals
+## Design priorities
 
-The firmware has four priorities:
-
-1. Present a standards-based USB HID Power Device to the host under test.
-2. Allow deterministic state injection over Ethernet and UART.
-3. Start in a safe state and require explicit arming before dangerous state changes.
-4. Stay small enough to fit the Leonardo/ATmega32U4.
-
-The current image is already at approximately 97% flash usage, so host-side implementation is preferred for most future features.
+1. Present one standards-based USB HID Power Device / UPS to the host under test.
+2. Allow deterministic fault injection over Ethernet and UART.
+3. Boot into a valid safe HID state and require explicit arming for mutation.
+4. Fail safe if the controller disappears while armed.
+5. Keep the main loop responsive; avoid blocking USB/network operations during a test.
+6. Stay inside the Leonardo/ATmega32U4 flash/RAM budget.
 
 ## Source layout
 
 ```text
 src/
-  HIDPowerDevice.h/.cpp       original HID UPS implementation
-  HIDPowerDeviceNUT.h/.cpp    optional NUT-specific HID extension
+  HIDPowerDevice.h/.cpp       base HID UPS implementation
+  HIDPowerDeviceNUT.h/.cpp    optional NUT-specific HID fragment
   HID/                        low-level HID support
 
 examples/
@@ -26,144 +24,99 @@ examples/
   UPS_Simulator_Ethernet/     Leonardo + W5500 simulator firmware
 
 python-driver/
-  src/ups_simulator/          Python TCP/UART control library
-  tests/                      Python unit/transport tests
-
-linux/
-  98-upower-hid.rules         Linux desktop/UDev HID-power rule
-
-docs/
-  ...                         user/developer documentation
-```
-
-## Firmware architecture
-
-```text
-                        +-----------------------+
-TCP/5000 -------------->|                       |
-Serial1/115200 -------->| command parser/state  |
-                        |                       |
-                        +-----------+-----------+
-                                    |
-                                updateModel()
-                                    |
-                  +-----------------+-----------------+
-                  |                                   |
-          PresentStatus                        measurements
-                  |                                   |
-                  +-----------------+-----------------+
-                                    |
-                             sendUsbReports()
-                                    |
-                             HID Power Device
-                                    |
-                                   USB
+  src/ups_simulator/          Python TCP/UART driver
+  tests/                      protocol/transport tests
 ```
 
 ## Startup sequence
 
-`setup()` performs roughly:
+The simulator `setup()` deliberately establishes a valid HID model before potentially slow Ethernet work:
 
-1. initialize USB CDC and hardware UART
+1. start USB CDC and `Serial1`
 2. configure heartbeat LED
-3. call `setSafeState()`
-4. register/set HID features
-5. start Ethernet using DHCP or fallback addressing
-6. calculate status
-7. send initial HID reports
+3. `setSafeState()`
+4. `updateModel()` so `PresentStatus` is valid
+5. register HID Feature storage
+6. attempt initial interrupt report
+7. initialize Ethernet/DHCP/fallback networking
 
-State is intentionally **not persisted**. A reset or unexpected power interruption returns the simulator to a disarmed safe state.
+This prevents a failed DHCP attempt from leaving the host with a zero-initialized `PresentStatus` that can look like on-battery/no-battery.
 
-## Safe state
-
-`setSafeState()` resets the important simulator values to:
-
-```text
-armed              false
-AC present          true
-battery             100 %
-battery voltage     13.00 V
-runtime             7200 s / AUTO model
-load                25 %
-input voltage       230.00 V
-output voltage      230.00 V
-start delay         -1
-shutdown delay      -1
-reboot delay        -1
-charging mode       AUTO
-low-battery mode    AUTO
-fault flags         cleared
-```
-
-Do not weaken this behavior when adding features.
+State is not persisted across MCU reset. Reboot always returns to the safe state.
 
 ## Main loop
 
-The loop is non-blocking and handles:
+The loop handles:
 
-- DHCP lease maintenance via `Ethernet.maintain()`
-- accepting/replacing a TCP control client
-- consuming line-oriented TCP input
-- consuming UART input
-- recomputing the simulated model
-- periodic/changed USB HID reports
+- arming-lease expiry
+- bounded DHCP maintenance when disarmed
+- accepting/replacing the TCP controller
+- TCP/UART command parsing
+- model recomputation
+- non-blocking USB interrupt-report attempts
 - heartbeat LED
 
-Avoid `delay()` in the main control path.
+Do not add `delay()` or long blocking work to the armed path.
 
-## Command parser
+### DHCP rule
 
-Commands enter `handleCommand()` from either TCP or UART.
+A failed initial DHCP request falls back to `169.254.42.42/16`. `Ethernet.maintain()` is called only if a lease was actually obtained. Maintenance is postponed while the simulator is armed because a failed renew/rebind can block inside the Arduino Ethernet DHCP implementation.
 
-Read-only commands are processed before the armed-state check. `ARM` and `RESET` are also available while disarmed. All simulated-state mutation occurs after `requireArmed()`.
+## Arming lease
 
-When adding a new state-changing command:
+`ARM ON` defaults to a 120-second firmware lease. `ARM ON n` accepts `0..3600` seconds, with `0` deliberately disabling expiry. Every received command refreshes the timer while armed.
 
-1. define the backing state variable
-2. choose safe reset behavior in `setSafeState()`
-3. validate arguments before changing state
-4. keep the command behind `requireArmed()`
-5. call `updateModel()` if derived status changes
-6. call `sendUsbReports(true)` if the USB host must see the change immediately
-7. expose the value in `STATUS?` when useful
-8. add a Python driver method/CLI command
-9. add tests
-10. update `CONTROL_PROTOCOL.md`
+If a non-zero lease expires:
 
-Keep firmware error messages compact (`ERR range`, `ERR mode`, etc.) because flash is constrained.
+```text
+setSafeState()
+updateModel()
+sendUsbReports(true)
+```
 
-## Model logic
+This is a firmware fail-safe and must not be replaced by Python-only cleanup.
 
-`updateModel()` calculates dynamic HID `PresentStatus` bits.
+## Command parser rules
 
-Important relationships include:
+Read-only commands and `REPORT` are available while disarmed. State-changing commands remain after `requireArmed()`.
 
-- AC absent + battery above zero -> discharging
-- AC present + battery below full + charging AUTO -> charging
-- battery <= remaining-capacity limit + LOWBAT AUTO -> low battery
-- discharging + runtime <= remaining-time limit -> remaining-time-limit expired
-- shutdown request or remaining-time expiry -> shutdown imminent
+When adding a state command:
 
-`RUNTIME AUTO` scales runtime from the full-runtime reference according to battery percentage.
+1. define safe reset behavior
+2. validate before mutation
+3. keep dangerous mutation behind the armed guard
+4. use atomic access if the value is shared with USB control requests
+5. update derived status
+6. request an immediate HID refresh if relevant
+7. expose useful state in `STATUS?`
+8. update Python API/CLI and tests
+9. update `CONTROL_PROTOCOL.md`
 
-## USB HID implementation
+The numeric parser intentionally accepts only optional `-` followed by decimal digits. It avoids linking `strtol`/`strtoul` on the flash-constrained AVR.
 
-### Base descriptor
+## USB HID architecture
 
-`HIDPowerDevice.cpp` contains the original HID Power Device descriptor and feature/report support.
+### One top-level UPS collection
 
-The simulator relies on features such as:
+`HIDPowerDevice.cpp` owns descriptor order. Its base descriptor leaves the UPS Application collection open, an optional extension hook is inserted, and a final one-byte descriptor node closes the Application collection.
 
-- battery chemistry
-- nominal/actual battery voltage
-- charge and capacity limits
-- runtime
-- delay-before-shutdown/reboot
-- `PresentStatus`
+The weak default hook returns no extension:
 
-### NUT extension descriptor
+```cpp
+__attribute__((weak)) HIDSubDescriptor* HIDPowerDevice_extension();
+```
 
-`HIDPowerDeviceNUT.cpp` adds fields that upstream NUT's `arduino-hid` subdriver maps but that the original library did not expose:
+When `HIDPowerDeviceNUT.cpp` is linked it provides the strong hook containing the NUT fragment. The compatibility object:
+
+```cpp
+HIDPowerDeviceNUT_ NutHidExtension;
+```
+
+forces that object file to link but does not append a second top-level descriptor itself. This removes cross-translation-unit constructor-order dependence and keeps Windows-facing HID topology to a single UPS Application collection.
+
+The original `examples/UPS` does not instantiate the extension object, so the NUT fragment is not linked for that sketch.
+
+### NUT extension paths
 
 ```text
 UPS.PowerSummary.DelayBeforeStartup
@@ -172,177 +125,159 @@ UPS.PowerConverter.Input.[1].Voltage
 UPS.PowerConverter.Output.Voltage
 ```
 
-These produce:
+Report IDs:
 
 ```text
-ups.delay.start / ups.timer.start
-ups.load
-input.voltage
-output.voltage
+0x21 DelayBeforeStartup
+0x22 PercentLoad
+0x23 InputVoltage
+0x24 OutputVoltage
 ```
 
-The extension is instantiated only by the Ethernet simulator:
+The Input collection uses collection type `0x81` because NUT interprets values >= `0x80` as indexed collections, producing the required `Input.[1]` path.
 
-```cpp
-HIDPowerDeviceNUT_ NutHidExtension;
-```
+`DelayBeforeStartup` explicitly declares seconds. Voltage fields use the centivolt HID unit encoding.
 
-This keeps the original `examples/UPS` behavior unchanged.
+`ups.load`, `input.voltage` and `output.voltage` require NUT 2.8.5+.
 
-## HID report IDs
+## Feature read/write safety
 
-The base implementation currently uses IDs through 32. The NUT extension reserves:
+The HID core stores pointers to Feature values. Host `SET_REPORT(Feature)` therefore writes directly into registered storage unless the feature is locked.
 
-```text
-0x21  DelayBeforeStartup
-0x22  PercentLoad
-0x23  InputVoltage
-0x24  OutputVoltage
-```
+The hardened implementation:
 
-New report IDs must be unique across all appended descriptors.
+- initializes `HIDReport::lock`
+- rejects writes to locked Feature reports
+- rejects malformed/oversized Feature requests
+- uses a fixed stack receive buffer instead of heap allocation in the USB request path
+- bounds USB serial-number copy length
 
-## Why `Input.[1]` is special
+The simulator locks measurements and identity values that it owns. Delay/alarm/limit Feature values that are intentionally host-writable remain writable.
 
-NUT's Arduino HID mapping expects:
+When adding a new Feature report, explicitly decide whether it is host writable and lock it if not.
 
-```text
-UPS.PowerConverter.Input.[1].Voltage
-```
+## AVR atomicity rules
 
-The NUT descriptor therefore declares the Input collection using collection value `0x81`. NUT's HID parser treats collection types >= `0x80` as indexed collections, yielding the required `[1]` path.
+ATmega32U4 is 8-bit. A 16-bit read/write can be interrupted between bytes.
 
-Changing this collection to an ordinary logical collection can make the firmware compile and enumerate while silently causing `input.voltage` to disappear from NUT.
+Any 16-bit value that is both:
 
-## HID units
+- accessed by the main loop, and
+- exposed as raw Feature storage to the USB control handler
 
-Battery/input/output voltage reports use the existing centivolt-style HID unit encoding. The simulator control protocol therefore stores voltage as integer centivolts:
+must use the small `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` helpers for loop-side reads/writes.
 
-```text
-13.00 V  -> 1300
-230.00 V -> 23000
-```
+Current examples include runtime, voltages, delay timers and remaining-time limit.
 
-The Python API hides this implementation detail from normal callers.
+`PresentStatus` is computed into a local complete snapshot and then published atomically. `STATUS?` likewise reads shared 16-bit values through atomic snapshots.
 
-## Host-writable HID features
+Never hold interrupts disabled around Ethernet, printing or other slow I/O.
 
-NUT can write some HID feature values, particularly delay fields. The USB HID feature storage is therefore part of the simulator's state.
+## USB interrupt reports
 
-Be careful when deciding whether a host-written value should trigger simulated shutdown behavior. The existing code intentionally gates shutdown-request contribution behind the simulator's armed state.
+Arduino AVR `USB_Send()` can block when the interrupt endpoint is full. The simulator therefore checks `USB_SendSpace()` before calling the HID report sender.
+
+`PresentStatus` is attempted first because it carries OL/OB/LB-related state. A report cycle is marked delivered only if the entire batch was queued. If any report cannot be queued, the previous snapshot remains unchanged so the next loop retries immediately.
+
+Do not change this to unconditional snapshot acknowledgement after a failed send.
 
 ## Networking
 
-The firmware uses Arduino Ethernet/W5500:
-
 ```text
-TCP port: 5000
-DHCP first
+TCP: 5000
+DHCP startup timeout: bounded
 fallback: 169.254.42.42/16
+one active controller
+newest TCP connection takes over
 ```
 
-The current implementation supports one active TCP control client. Do not add HTTP/TLS/web UI to the Leonardo; implement those on a Linux/Cockpit/Python host.
+`EthernetServer::accept()` is required rather than `available()` because the firmware speaks first with a greeting. Using `available()` delays discovery until client data arrives and breaks reply framing.
 
-## UART
+The raw TCP protocol has no authentication. Network isolation/firewalling must protect access; Python-side authentication cannot protect a port that the Arduino accepts directly.
 
-`Serial1` uses the same protocol at 115200 baud. USB `Serial` is not the primary control path and should not be confused with the hardware UART.
+## Resource budget
 
-## Memory budget
+Pinned CI toolchain:
 
-Reference CI result:
+- Arduino AVR core 1.8.8
+- Ethernet 2.0.2
+- warnings enabled
+
+Current reference build:
 
 ```text
 Original UPS:
-  flash  9818 / 28672 (34%)
-  RAM     302 / 2560  (11%)
+  flash 10,176 / 28,672
+  RAM      330 / 2,560
 
 Ethernet/NUT simulator:
-  flash 28070 / 28672 (97%)
-  RAM    1296 / 2560  (50%)
+  flash 27,854 / 28,672
+  RAM    1,321 / 2,560
 ```
 
-Only about 602 bytes of application flash remain with the reference toolchain.
+CI enforces `<= 28,160` bytes for the Ethernet simulator, preserving at least 512 bytes of application flash for future reliability fixes.
 
 ### Feature placement rule
 
-Implement in **firmware** only when the feature must directly affect USB HID enumeration/reporting or the minimal control transport.
+Implement in firmware only when the feature must directly participate in HID behavior, minimal transport, or safety fail-safe behavior.
 
-Implement in **Python/Cockpit** when the feature is:
+Prefer Python/Cockpit for:
 
-- scenario automation
-- timed battery drain/charge models
+- scenario engines
+- timed battery models
 - UI
-- configuration storage
-- authentication/access control
-- logging
-- retries/reconnect policies
+- persistence
+- authentication services
+- logs/reports
+- retries/reconnect orchestration
 - NUT assertions
-- shutdown orchestration
-- test reports
+- Synology/client workflow logic
 
-## Building locally
+## Build locally
 
-See [FLASHING.md](FLASHING.md). The CI-equivalent build is:
+Use the same versions as CI:
 
 ```bash
-arduino-cli core install arduino:avr
-arduino-cli lib install Ethernet
-arduino-cli compile --fqbn arduino:avr:leonardo \
+arduino-cli core update-index
+arduino-cli core install arduino:avr@1.8.8
+arduino-cli lib install Ethernet@2.0.2
+arduino-cli compile --warnings all --fqbn arduino:avr:leonardo \
   ~/Arduino/libraries/HIDPowerDevice/examples/UPS
-arduino-cli compile --fqbn arduino:avr:leonardo \
+arduino-cli compile --warnings all --fqbn arduino:avr:leonardo \
   ~/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet
 ```
 
-## Python-side development
-
-From repository root:
+Python tests:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 python -m pip install -e ./python-driver
 python -m unittest discover -s python-driver/tests -v
 ```
 
-Windows PowerShell activation:
+## Pre-merge checklist
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-The CI matrix currently checks Python 3.9 and 3.13.
-
-## Development checklist
-
-Before merging firmware changes:
-
-- original `UPS` example still compiles
-- Ethernet simulator still fits Leonardo flash/RAM
-- safe state unchanged unless deliberately documented
-- dangerous commands still require arming
-- no blocking loop behavior added
+- original UPS example compiles
+- simulator passes the 28,160-byte CI flash budget
+- repository code is warning-clean under the pinned build aside from upstream Arduino-core warnings
+- safe boot state is preserved
+- arming lease still returns abandoned tests to safe state
+- no blocking DHCP maintenance while armed
+- one top-level UPS Application collection remains
 - HID report IDs remain unique
-- NUT paths match upstream mapping exactly
-- Python API and CLI are updated for protocol changes
-- Python tests pass
-- documentation matches command names and units
+- shared 16-bit state is accessed atomically
+- read-only Features reject host writes
+- Python transport works with immediate and delayed greeting timing
+- Python tests pass on 3.9 and 3.13
+- NUT/documentation versions and command names match the firmware
 
-## Recommended future architecture
+## Hardware validation before release
 
-Because AVR flash is effectively exhausted, future Nut-ups integration should use:
+CI cannot prove physical USB/W5500 behavior. Verify on real hardware:
 
-```text
-Cockpit UI / scenario engine
-          |
-      Python driver
-          |
-      TCP port 5000
-          |
-Leonardo + W5500
-          |
-      USB HID UPS
-          |
-          NUT
-```
-
-If substantially richer firmware becomes necessary, move to a native-USB MCU with materially more flash/RAM rather than continuing to squeeze features into ATmega32U4.
+- TCP greeting immediately after connect
+- fallback address with no DHCP
+- responsive commands during no-DHCP operation
+- no transient OB/RB event on simulator reboot
+- NUT 2.8.5+ extended variables
+- single UPS/battery device on Windows if Windows compatibility matters
+- new controller can recover from a stale/abandoned TCP session

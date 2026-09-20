@@ -14,11 +14,11 @@ jobs:
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Install AVR core and Ethernet library
+      - name: Install pinned AVR core and Ethernet library
         run: |
           arduino-cli core update-index
-          arduino-cli core install arduino:avr
-          arduino-cli lib install Ethernet
+          arduino-cli core install arduino:avr@1.8.8
+          arduino-cli lib install Ethernet@2.0.2
 
       - name: Install this repository as an Arduino library
         run: |
@@ -27,8 +27,18 @@ jobs:
 
       - name: Compile original UPS example for Leonardo
         run: |
-          arduino-cli compile --fqbn arduino:avr:leonardo "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS"
+          arduino-cli compile --warnings all --fqbn arduino:avr:leonardo \
+            "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS"
 
-      - name: Compile Ethernet simulator for Leonardo
+      - name: Compile Ethernet simulator for Leonardo and enforce flash budget
         run: |
-          arduino-cli compile --fqbn arduino:avr:leonardo "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet"
+          set +e
+          out=$(arduino-cli compile --warnings all --fqbn arduino:avr:leonardo \
+            "$HOME/Arduino/libraries/HIDPowerDevice/examples/UPS_Simulator_Ethernet" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          test "$rc" -eq 0
+          used=$(printf '%s\n' "$out" | sed -n 's/^Sketch uses \([0-9][0-9]*\) bytes.*/\1/p' | head -n1)
+          test -n "$used"
+          test "$used" -le 28160

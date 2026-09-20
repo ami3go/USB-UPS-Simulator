@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import select
 import socket
-import time
+import warnings
 from typing import Dict, Iterator, Optional, Protocol, Union
 
 
@@ -47,10 +46,13 @@ class SocketLineTransport:
         try:
             self._sock = socket.create_connection((self.host, self.port), self.timeout)
             self._sock.settimeout(self.timeout)
-            self._drain_greeting()
+            self._sync()
         except OSError as exc:
             self.close()
             raise TransportError(f"cannot connect to {self.host}:{self.port}: {exc}") from exc
+        except SimulatorError:
+            self.close()
+            raise
 
     def close(self) -> None:
         if self._sock is not None:
@@ -83,22 +85,26 @@ class SocketLineTransport:
                 raise TransportError("simulator closed the TCP connection")
             self._rx.extend(chunk)
 
-    def _drain_greeting(self, window: float = 0.25) -> None:
-        if self._sock is None:
-            return
-        deadline = time.monotonic() + window
-        while True:
-            if b"\n" in self._rx:
-                self.greeting.append(self._readline())
-                continue
+    def _sync(self, max_lines: int = 8) -> None:
+        """Align the reply stream after connecting.
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        Old firmware only emits its greeting after receiving the first command;
+        fixed firmware greets immediately. Sending PING and reading through its
+        reply handles both behaviours without relying on timing.
+        """
+        if self._sock is None:
+            raise TransportError("transport is not connected")
+        self.greeting = []
+        try:
+            self._sock.sendall(b"PING\n")
+        except OSError as exc:
+            raise TransportError(f"socket send failed: {exc}") from exc
+        for _ in range(max_lines):
+            line = self._readline()
+            if line == "OK PONG":
                 return
-            ready, _, _ = select.select([self._sock], [], [], remaining)
-            if not ready:
-                return
-            self.greeting.append(self._readline())
+            self.greeting.append(line)
+        raise ProtocolError("simulator did not answer PING while connecting")
 
     def command(self, command: str) -> str:
         self.connect()
@@ -140,9 +146,32 @@ class SerialLineTransport:
                 write_timeout=self.timeout,
             )
             self._serial.reset_input_buffer()
+            self._sync()
+        except SimulatorError:
+            self.close()
+            raise
         except Exception as exc:
-            self._serial = None
+            self.close()
             raise TransportError(f"cannot open serial port {self.port}: {exc}") from exc
+
+    def _sync(self, max_lines: int = 8) -> None:
+        """Skip boot/banner lines so the first command reply is aligned."""
+        if self._serial is None:
+            raise TransportError("serial transport is not connected")
+        try:
+            self._serial.write(b"PING\n")
+            self._serial.flush()
+            for _ in range(max_lines):
+                raw = self._serial.readline()
+                if not raw:
+                    raise TransportError("timeout waiting for simulator response")
+                if raw.rstrip(b"\r\n") == b"OK PONG":
+                    return
+        except SimulatorError:
+            raise
+        except Exception as exc:
+            raise TransportError(f"serial I/O failed: {exc}") from exc
+        raise ProtocolError("simulator did not answer PING while connecting")
 
     def close(self) -> None:
         if self._serial is not None:
@@ -281,6 +310,10 @@ class UpsSimulator:
 
     def connect(self) -> "UpsSimulator":
         self.transport.connect()
+        ident = self.identify()
+        if ident != "NutUPS HID Simulator v2":
+            self.close()
+            raise ProtocolError(f"unsupported simulator firmware: {ident!r}; expected v2")
         return self
 
     def close(self) -> None:
@@ -340,8 +373,16 @@ class UpsSimulator:
             port=_as_int(values, "port"),
         )
 
-    def arm(self, enabled: bool = True) -> None:
-        self.raw_command(f"ARM {'ON' if enabled else 'OFF'}")
+    def arm(self, enabled: bool = True, lease_seconds: Optional[int] = None) -> None:
+        if not enabled:
+            self.raw_command("ARM OFF")
+            return
+        if lease_seconds is None:
+            self.raw_command("ARM ON")
+            return
+        if not 0 <= lease_seconds <= 3600:
+            raise ValueError("arm lease must be in range 0..3600 seconds")
+        self.raw_command(f"ARM ON {lease_seconds}")
 
     def disarm(self) -> None:
         self.arm(False)
@@ -437,13 +478,30 @@ class UpsSimulator:
         self.raw_command(f"SHUTDOWN {'ON' if enabled else 'OFF'}")
 
     @contextmanager
-    def armed_session(self, reset_on_exit: bool = True) -> Iterator["UpsSimulator"]:
-        """Arm for a test and restore a safe state when leaving the context."""
-        self.arm(True)
+    def armed_session(
+        self, reset_on_exit: bool = True, lease_seconds: Optional[int] = None
+    ) -> Iterator["UpsSimulator"]:
+        """Arm for a test and restore a safe state when leaving the context.
+
+        If the body raises and cleanup also fails, the original exception is
+        preserved and the cleanup failure is emitted as a RuntimeWarning.
+        """
+        self.arm(True, lease_seconds=lease_seconds)
         try:
             yield self
-        finally:
-            if reset_on_exit:
-                self.reset()
-            else:
-                self.disarm()
+        except BaseException:
+            try:
+                self._restore(reset_on_exit)
+            except SimulatorError as cleanup_exc:
+                warnings.warn(
+                    f"could not restore simulator safe state: {cleanup_exc}",
+                    RuntimeWarning,
+                )
+            raise
+        self._restore(reset_on_exit)
+
+    def _restore(self, reset_on_exit: bool) -> None:
+        if reset_on_exit:
+            self.reset()
+        else:
+            self.disarm()

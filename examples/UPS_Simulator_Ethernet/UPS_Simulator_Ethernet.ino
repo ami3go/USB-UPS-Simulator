@@ -2,14 +2,20 @@
 #include <HIDPowerDeviceNUT.h>
 #include <SPI.h>
 #include <Ethernet.h>
-#include <strings.h>
-#include <stdlib.h>
+#include <string.h>
+#include <util/atomic.h>
 
 #define CONTROL_PORT 5000
 #define UART_BAUD 115200
 #define REPORT_INTERVAL_MS 5000UL
 #define HEARTBEAT_INTERVAL_MS 1000UL
 #define SD_CS_PIN 4
+#define DHCP_TIMEOUT_MS 10000UL
+#define DHCP_RESPONSE_TIMEOUT_MS 2000UL
+#define DHCP_MAINTAIN_INTERVAL_MS 1000UL
+#define DHCP_RETRY_INTERVAL_MS 60000UL
+#define ARM_DEFAULT_LEASE_SEC 120UL
+#define ARM_MAX_LEASE_SEC 3600UL
 
 HIDPowerDeviceNUT_ NutHidExtension;
 
@@ -83,11 +89,41 @@ SimulatorState sim;
 unsigned long lastReportMs = 0;
 unsigned long lastHeartbeatMs = 0;
 bool heartbeatState = false;
+bool dhcpLeased = false;
+unsigned long nextDhcpMaintainMs = 0;
+unsigned long armLeaseMs = 0;
+unsigned long lastCommandMs = 0;
 
 char netLine[96];
 size_t netLineLength = 0;
 char uartLine[96];
 size_t uartLineLength = 0;
+
+uint16_t atomicReadU16(const uint16_t &value) {
+  uint16_t copy;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { copy = value; }
+  return copy;
+}
+
+int16_t atomicReadI16(const int16_t &value) {
+  int16_t copy;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { copy = value; }
+  return copy;
+}
+
+void atomicWriteU16(uint16_t &target, uint16_t value) {
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { target = value; }
+}
+
+void atomicWriteI16(int16_t &target, int16_t value) {
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { target = value; }
+}
+
+PresentStatus atomicReadStatus() {
+  PresentStatus copy;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { copy = iPresentStatus; }
+  return copy;
+}
 
 void setSafeState() {
   sim.armed = false;
@@ -99,16 +135,18 @@ void setSafeState() {
   sim.runtimeAuto = true;
   sim.charging = OVERRIDE_AUTO;
   sim.lowBattery = OVERRIDE_AUTO;
+  armLeaseMs = 0;
+  lastCommandMs = 0;
 
   iRemaining = 100;
-  iVoltage = 1300;
-  iRunTimeToEmpty = iAvgTimeToEmpty;
-  iDelayBe4Startup = -1;
-  iDelayBe4Reboot = -1;
-  iDelayBe4ShutDown = -1;
+  atomicWriteU16(iVoltage, 1300);
+  atomicWriteU16(iRunTimeToEmpty, atomicReadU16(iAvgTimeToEmpty));
+  atomicWriteI16(iDelayBe4Startup, -1);
+  atomicWriteI16(iDelayBe4Reboot, -1);
+  atomicWriteI16(iDelayBe4ShutDown, -1);
   iPercentLoad = 25;
-  iInputVoltage = 23000;
-  iOutputVoltage = 23000;
+  atomicWriteU16(iInputVoltage, 23000);
+  atomicWriteU16(iOutputVoltage, 23000);
 }
 
 bool parseOnOff(const char *token, bool &value) {
@@ -136,21 +174,28 @@ bool parseOverride(const char *token, OverrideMode &mode) {
   return true;
 }
 
-bool parseUnsigned(const char *token, unsigned long minValue, unsigned long maxValue, unsigned long &value) {
+bool parseSigned(const char *token, long minValue, long maxValue, long &value) {
   if (!token || !*token) return false;
-  char *end = NULL;
-  unsigned long parsed = strtoul(token, &end, 10);
-  if (*end != '\0' || parsed < minValue || parsed > maxValue) return false;
+  const bool negative = (*token == '-');
+  if (negative && !*++token) return false;
+
+  long parsed = 0;
+  for (; *token; ++token) {
+    if (*token < '0' || *token > '9') return false;
+    parsed = parsed * 10 + (*token - '0');
+    if (parsed > 99999L) return false;
+  }
+
+  if (negative) parsed = -parsed;
+  if (parsed < minValue || parsed > maxValue) return false;
   value = parsed;
   return true;
 }
 
-bool parseSigned(const char *token, long minValue, long maxValue, long &value) {
-  if (!token || !*token) return false;
-  char *end = NULL;
-  long parsed = strtol(token, &end, 10);
-  if (*end != '\0' || parsed < minValue || parsed > maxValue) return false;
-  value = parsed;
+bool parseUnsigned(const char *token, unsigned long minValue, unsigned long maxValue, unsigned long &value) {
+  long parsed;
+  if (!parseSigned(token, (long)minValue, (long)maxValue, parsed)) return false;
+  value = (unsigned long)parsed;
   return true;
 }
 
@@ -161,83 +206,118 @@ const __FlashStringHelper *overrideName(OverrideMode mode) {
 }
 
 void updateModel() {
-  if (sim.runtimeAuto) {
-    iRunTimeToEmpty = (uint16_t)((uint32_t)iAvgTimeToEmpty * iRemaining / iFullChargeCapacity);
+  const int16_t hostShutdownDelay = atomicReadI16(iDelayBe4ShutDown);
+  const uint16_t remainTimeLimit = atomicReadU16(iRemainTimeLimit);
+
+  if (sim.runtimeAuto && iFullChargeCapacity) {
+    const uint16_t avgEmpty = atomicReadU16(iAvgTimeToEmpty);
+    atomicWriteU16(iRunTimeToEmpty,
+                   (uint16_t)((uint32_t)avgEmpty * iRemaining / iFullChargeCapacity));
   }
 
+  const uint16_t runtime = atomicReadU16(iRunTimeToEmpty);
   const bool autoCharging = sim.acPresent && (iRemaining < iFullChargeCapacity);
   const bool charging = (sim.charging == OVERRIDE_AUTO) ? autoCharging : (sim.charging == OVERRIDE_ON);
   const bool discharging = !sim.acPresent && iRemaining > 0;
   const bool autoLowBattery = iRemaining <= iRemnCapacityLimit;
   const bool lowBattery = (sim.lowBattery == OVERRIDE_AUTO) ? autoLowBattery : (sim.lowBattery == OVERRIDE_ON);
 
-  iPresentStatus.Charging = charging;
-  iPresentStatus.Discharging = discharging;
-  iPresentStatus.ACPresent = sim.acPresent;
-  iPresentStatus.BatteryPresent = 1;
-  iPresentStatus.BelowRemainingCapacityLimit = lowBattery;
-  iPresentStatus.RemainingTimeLimitExpired = discharging && (iRunTimeToEmpty <= iRemainTimeLimit);
-  iPresentStatus.NeedReplacement = sim.needReplacement;
-  iPresentStatus.VoltageNotRegulated = 0;
-  iPresentStatus.FullyCharged = iRemaining >= iFullChargeCapacity;
-  iPresentStatus.FullyDischarged = iRemaining == 0;
-  iPresentStatus.ShutdownRequested = sim.armed && (sim.shutdownRequested || (iDelayBe4ShutDown > 0));
-  iPresentStatus.ShutdownImminent = iPresentStatus.ShutdownRequested || iPresentStatus.RemainingTimeLimitExpired;
-  iPresentStatus.CommunicationLost = sim.communicationLost;
-  iPresentStatus.Overload = sim.overload;
+  PresentStatus s = {};
+  s.Charging = charging;
+  s.Discharging = discharging;
+  s.ACPresent = sim.acPresent;
+  s.BatteryPresent = 1;
+  s.BelowRemainingCapacityLimit = lowBattery;
+  s.RemainingTimeLimitExpired = discharging && (runtime <= remainTimeLimit);
+  s.NeedReplacement = sim.needReplacement;
+  s.VoltageNotRegulated = 0;
+  s.FullyCharged = iRemaining >= iFullChargeCapacity;
+  s.FullyDischarged = iRemaining == 0;
+  s.ShutdownRequested = sim.armed && (sim.shutdownRequested || (hostShutdownDelay > 0));
+  s.ShutdownImminent = s.ShutdownRequested || s.RemainingTimeLimitExpired;
+  s.CommunicationLost = sim.communicationLost;
+  s.Overload = sim.overload;
+
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { iPresentStatus = s; }
+}
+
+bool usbSend(uint8_t id, const void *data, uint8_t len) {
+  return USB_SendSpace(HID_TX) >= (uint8_t)(len + 1) &&
+         PowerDevice.sendReport(id, data, len) >= 0;
 }
 
 void sendUsbReports(bool force) {
   const unsigned long now = millis();
+  const PresentStatus status = atomicReadStatus();
+  const uint16_t runtime = atomicReadU16(iRunTimeToEmpty);
+  const uint16_t batteryVoltage = atomicReadU16(iVoltage);
+  const uint16_t inputVoltage = atomicReadU16(iInputVoltage);
+  const uint16_t outputVoltage = atomicReadU16(iOutputVoltage);
+
   const bool changed =
-      (iPresentStatus != iPreviousStatus) ||
+      (status != iPreviousStatus) ||
       (iRemaining != iPrevRemaining) ||
-      (iRunTimeToEmpty != iPrevRunTimeToEmpty);
+      (runtime != iPrevRunTimeToEmpty);
 
   if (!force && !changed && (now - lastReportMs < REPORT_INTERVAL_MS)) return;
 
-  PowerDevice.sendReport(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
-  PowerDevice.sendReport(HID_PD_RUNTIMETOEMPTY, &iRunTimeToEmpty, sizeof(iRunTimeToEmpty));
-  PowerDevice.sendReport(HID_PD_VOLTAGE, &iVoltage, sizeof(iVoltage));
-  PowerDevice.sendReport(HID_PD_PERCENTLOAD, &iPercentLoad, sizeof(iPercentLoad));
-  PowerDevice.sendReport(HID_PD_INPUTVOLTAGE, &iInputVoltage, sizeof(iInputVoltage));
-  PowerDevice.sendReport(HID_PD_OUTPUTVOLTAGE, &iOutputVoltage, sizeof(iOutputVoltage));
-  PowerDevice.sendReport(HID_PD_PRESENTSTATUS, &iPresentStatus, sizeof(iPresentStatus));
+  bool sent = usbSend(HID_PD_PRESENTSTATUS, &status, sizeof(status));
+  if (sent) sent = usbSend(HID_PD_REMAININGCAPACITY, &iRemaining, sizeof(iRemaining));
+  if (sent) sent = usbSend(HID_PD_RUNTIMETOEMPTY, &runtime, sizeof(runtime));
+  if (sent) sent = usbSend(HID_PD_VOLTAGE, &batteryVoltage, sizeof(batteryVoltage));
+  if (sent) sent = usbSend(HID_PD_PERCENTLOAD, &iPercentLoad, sizeof(iPercentLoad));
+  if (sent) sent = usbSend(HID_PD_INPUTVOLTAGE, &inputVoltage, sizeof(inputVoltage));
+  if (sent) sent = usbSend(HID_PD_OUTPUTVOLTAGE, &outputVoltage, sizeof(outputVoltage));
 
-  iPreviousStatus = iPresentStatus;
-  iPrevRemaining = iRemaining;
-  iPrevRunTimeToEmpty = iRunTimeToEmpty;
-  lastReportMs = now;
+  if (sent) {
+    iPreviousStatus = status;
+    iPrevRemaining = iRemaining;
+    iPrevRunTimeToEmpty = runtime;
+    lastReportMs = now;
+  }
 }
 
 void printStatus(Print &out) {
   updateModel();
+  const PresentStatus status = atomicReadStatus();
+  const uint16_t runtime = atomicReadU16(iRunTimeToEmpty);
+  const uint16_t batteryVoltage = atomicReadU16(iVoltage);
+  const uint16_t inputVoltage = atomicReadU16(iInputVoltage);
+  const uint16_t outputVoltage = atomicReadU16(iOutputVoltage);
+  const int16_t startDelay = atomicReadI16(iDelayBe4Startup);
+  const int16_t shutdownDelay = atomicReadI16(iDelayBe4ShutDown);
+  const int16_t rebootDelay = atomicReadI16(iDelayBe4Reboot);
+
   out.print(F("OK armed=")); out.print(sim.armed ? 1 : 0);
   out.print(F(" ac=")); out.print(sim.acPresent ? 1 : 0);
   out.print(F(" battery=")); out.print(iRemaining);
-  out.print(F(" runtime=")); out.print(iRunTimeToEmpty);
+  out.print(F(" runtime=")); out.print(runtime);
   out.print(F(" runtime_mode=")); out.print(sim.runtimeAuto ? F("auto") : F("manual"));
-  out.print(F(" voltage_cv=")); out.print(iVoltage);
+  out.print(F(" voltage_cv=")); out.print(batteryVoltage);
   out.print(F(" load=")); out.print(iPercentLoad);
-  out.print(F(" input_voltage_cv=")); out.print(iInputVoltage);
-  out.print(F(" output_voltage_cv=")); out.print(iOutputVoltage);
+  out.print(F(" input_voltage_cv=")); out.print(inputVoltage);
+  out.print(F(" output_voltage_cv=")); out.print(outputVoltage);
   out.print(F(" charging_mode=")); out.print(overrideName(sim.charging));
-  out.print(F(" charging_active=")); out.print(iPresentStatus.Charging ? 1 : 0);
+  out.print(F(" charging_active=")); out.print(status.Charging ? 1 : 0);
   out.print(F(" lowbat_mode=")); out.print(overrideName(sim.lowBattery));
-  out.print(F(" lowbat_active=")); out.print(iPresentStatus.BelowRemainingCapacityLimit ? 1 : 0);
+  out.print(F(" lowbat_active=")); out.print(status.BelowRemainingCapacityLimit ? 1 : 0);
   out.print(F(" overload=")); out.print(sim.overload ? 1 : 0);
   out.print(F(" replace=")); out.print(sim.needReplacement ? 1 : 0);
   out.print(F(" commlost=")); out.print(sim.communicationLost ? 1 : 0);
   out.print(F(" shutdown=")); out.print(sim.shutdownRequested ? 1 : 0);
-  out.print(F(" shutdown_imminent=")); out.print(iPresentStatus.ShutdownImminent ? 1 : 0);
-  out.print(F(" host_start_delay=")); out.print(iDelayBe4Startup);
-  out.print(F(" host_shutdown_delay=")); out.print(iDelayBe4ShutDown);
-  out.print(F(" host_reboot_delay=")); out.print(iDelayBe4Reboot);
+  out.print(F(" shutdown_imminent=")); out.print(status.ShutdownImminent ? 1 : 0);
+  out.print(F(" host_start_delay=")); out.print(startDelay);
+  out.print(F(" host_shutdown_delay=")); out.print(shutdownDelay);
+  out.print(F(" host_reboot_delay=")); out.print(rebootDelay);
   out.print(F(" ip=")); out.println(Ethernet.localIP());
 }
 
+void printIdent(Print &out) {
+  out.println(F("OK NutUPS HID Simulator v2"));
+}
+
 void printHelp(Print &out) {
-  out.println(F("OK commands: see docs/NUT_VARIABLES.md"));
+  out.println(F("OK docs/CONTROL_PROTOCOL.md"));
 }
 
 bool requireArmed(Print &out) {
@@ -265,13 +345,16 @@ void handleCommand(char *line, Print &out) {
   char *save = NULL;
   char *command = strtok_r(line, " \t", &save);
   char *arg = strtok_r(NULL, " \t", &save);
+  char *arg2 = strtok_r(NULL, " \t", &save);
+
+  if (sim.armed) lastCommandMs = millis();
 
   if (!strcasecmp(command, "PING")) {
     out.println(F("OK PONG"));
     return;
   }
   if (!strcasecmp(command, "IDENT?")) {
-    out.println(F("OK NutUPS HID Simulator v2"));
+    printIdent(out);
     return;
   }
   if (!strcasecmp(command, "HELP") || !strcmp(command, "?")) {
@@ -297,7 +380,14 @@ void handleCommand(char *line, Print &out) {
       return;
     }
     if (value) {
+      unsigned long leaseSec = ARM_DEFAULT_LEASE_SEC;
+      if (arg2 && !parseUnsigned(arg2, 0, ARM_MAX_LEASE_SEC, leaseSec)) {
+        out.println(F("ERR range"));
+        return;
+      }
       sim.armed = true;
+      armLeaseMs = leaseSec * 1000UL;
+      lastCommandMs = millis();
       out.println(F("OK armed"));
     } else {
       setSafeState();
@@ -316,14 +406,15 @@ void handleCommand(char *line, Print &out) {
     return;
   }
 
-  if (!requireArmed(out)) return;
-
   if (!strcasecmp(command, "REPORT")) {
     updateModel();
     sendUsbReports(true);
     out.println(F("OK"));
     return;
   }
+
+  if (!requireArmed(out)) return;
+
   if (!strcasecmp(command, "AC")) {
     applyBooleanCommand(out, arg, sim.acPresent);
     return;
@@ -368,25 +459,25 @@ void handleCommand(char *line, Print &out) {
     iPercentLoad = (byte)value;
   } else if (!strcasecmp(command, "VOLTAGE")) {
     if (!parseUnsigned(arg, 0, 65535UL, value)) { out.println(F("ERR range")); return; }
-    iVoltage = (uint16_t)value;
+    atomicWriteU16(iVoltage, (uint16_t)value);
   } else if (!strcasecmp(command, "INPUTVOLTAGE")) {
     if (!parseUnsigned(arg, 0, 65535UL, value)) { out.println(F("ERR range")); return; }
-    iInputVoltage = (uint16_t)value;
+    atomicWriteU16(iInputVoltage, (uint16_t)value);
   } else if (!strcasecmp(command, "OUTPUTVOLTAGE")) {
     if (!parseUnsigned(arg, 0, 65535UL, value)) { out.println(F("ERR range")); return; }
-    iOutputVoltage = (uint16_t)value;
+    atomicWriteU16(iOutputVoltage, (uint16_t)value);
   } else if (!strcasecmp(command, "RUNTIME")) {
     if (arg && !strcasecmp(arg, "AUTO")) {
       sim.runtimeAuto = true;
     } else {
       if (!parseUnsigned(arg, 0, 65535UL, value)) { out.println(F("ERR range")); return; }
       sim.runtimeAuto = false;
-      iRunTimeToEmpty = (uint16_t)value;
+      atomicWriteU16(iRunTimeToEmpty, (uint16_t)value);
     }
   } else if (!strcasecmp(command, "STARTDELAY")) {
     long signedValue = 0;
     if (!parseSigned(arg, -1, 32767L, signedValue)) { out.println(F("ERR range")); return; }
-    iDelayBe4Startup = (int16_t)signedValue;
+    atomicWriteI16(iDelayBe4Startup, (int16_t)signedValue);
   } else {
     out.println(F("ERR command"));
     return;
@@ -419,11 +510,23 @@ void pollStream(Stream &input, Print &output, char *buffer, size_t &length, size
 void initEthernet() {
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
-  if (Ethernet.begin(macAddress) == 0) {
+  dhcpLeased = Ethernet.begin(macAddress, DHCP_TIMEOUT_MS, DHCP_RESPONSE_TIMEOUT_MS) != 0;
+  if (!dhcpLeased) {
     Ethernet.begin(macAddress, fallbackIp, fallbackDns, fallbackGateway, fallbackSubnet);
   }
+  nextDhcpMaintainMs = millis() + DHCP_MAINTAIN_INTERVAL_MS;
   controlServer.begin();
 }
+
+const uint8_t kReadOnlyFeatures[] PROGMEM = {
+  HID_PD_IPRODUCT, HID_PD_SERIAL, HID_PD_MANUFACTURER,
+  HID_PD_PRESENTSTATUS, HID_PD_RUNTIMETOEMPTY, HID_PD_AVERAGETIME2FULL, HID_PD_AVERAGETIME2EMPTY,
+  HID_PD_RECHARGEABLE, HID_PD_CAPACITYMODE, HID_PD_CONFIGVOLTAGE, HID_PD_VOLTAGE,
+  HID_PD_PERCENTLOAD, HID_PD_INPUTVOLTAGE, HID_PD_OUTPUTVOLTAGE, HID_PD_IDEVICECHEMISTRY,
+  HID_PD_IOEMINFORMATION, HID_PD_DESIGNCAPACITY, HID_PD_FULLCHRGECAPACITY,
+  HID_PD_REMAININGCAPACITY, HID_PD_CPCTYGRANULARITY1, HID_PD_CPCTYGRANULARITY2,
+  HID_PD_MANUFACTUREDATE
+};
 
 void setupHid() {
   PowerDevice.begin();
@@ -458,6 +561,10 @@ void setupHid() {
 
   iManufacturerDate = (2026 - 1980) * 512 + 9 * 32 + 19;
   PowerDevice.setFeature(HID_PD_MANUFACTUREDATE, &iManufacturerDate, sizeof(iManufacturerDate));
+
+  for (uint8_t i = 0; i < sizeof(kReadOnlyFeatures); i++) {
+    HID().LockFeature(pgm_read_byte(&kReadOnlyFeatures[i]), true);
+  }
 }
 
 void setup() {
@@ -465,25 +572,37 @@ void setup() {
   Serial1.begin(UART_BAUD);
   pinMode(LED_BUILTIN, OUTPUT);
   setSafeState();
-  setupHid();
-  initEthernet();
   updateModel();
+  setupHid();
   sendUsbReports(true);
+  initEthernet();
   Serial1.println(F("NutUPS ready"));
 }
 
 void loop() {
-  Ethernet.maintain();
+  const unsigned long now = millis();
 
-  if (!controlClient || !controlClient.connected()) {
+  if (sim.armed && armLeaseMs && (unsigned long)(now - lastCommandMs) >= armLeaseMs) {
+    setSafeState();
+    updateModel();
+    sendUsbReports(true);
+  }
+
+  if (!sim.armed && dhcpLeased && (long)(now - nextDhcpMaintainMs) >= 0) {
+    const int rc = Ethernet.maintain();
+    nextDhcpMaintainMs = millis() +
+        ((rc == 1 || rc == 3) ? DHCP_RETRY_INTERVAL_MS : DHCP_MAINTAIN_INTERVAL_MS);
+  }
+
+  EthernetClient candidate = controlServer.accept();
+  if (candidate) {
     if (controlClient) controlClient.stop();
-    EthernetClient candidate = controlServer.available();
-    if (candidate) {
-      controlClient = candidate;
-      netLineLength = 0;
-      controlClient.println(F("OK NutUPS HID Simulator v2"));
-      controlClient.println(F("OK DISARMED"));
-    }
+    controlClient = candidate;
+    netLineLength = 0;
+    printIdent(controlClient);
+    controlClient.println(sim.armed ? F("OK ARMED") : F("OK DISARMED"));
+  } else if (controlClient && !controlClient.connected()) {
+    controlClient.stop();
   }
 
   if (controlClient && controlClient.connected()) {
@@ -494,7 +613,6 @@ void loop() {
   updateModel();
   sendUsbReports(false);
 
-  const unsigned long now = millis();
   if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
     lastHeartbeatMs = now;
     heartbeatState = !heartbeatState;

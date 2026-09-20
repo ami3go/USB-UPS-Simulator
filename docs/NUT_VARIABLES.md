@@ -2,6 +2,8 @@
 
 The Ethernet simulator is designed to work with NUT's `usbhid-ups` driver and its upstream `arduino-hid` subdriver for the `HIDPowerDevice` Arduino implementation.
 
+> **NUT version:** `ups.load`, `input.voltage` and `output.voltage` require the `arduino-hid` mappings shipped with **NUT 2.8.5 or later**. NUT 2.8.0-2.8.4 can still use the core battery/status fields and `ups.delay.start`, but those three newer measurements will not be exported by `upsc`.
+
 ## Core variables
 
 | NUT variable | HID path | Simulator source/control |
@@ -14,16 +16,16 @@ The Ethernet simulator is designed to work with NUT's `usbhid-ups` driver and it
 | `battery.charge` | `UPS.PowerSummary.RemainingCapacity` | `BATTERY` / `set_battery()` |
 | `battery.charge.low` | `UPS.PowerSummary.RemainingCapacityLimit` | fixed 5% |
 | `battery.charge.warning` | `UPS.PowerSummary.WarningCapacityLimit` | fixed 10% |
-| `ups.load` | `UPS.PowerSummary.PercentLoad` | `LOAD` / `set_load()` |
-| `input.voltage` | `UPS.PowerConverter.Input.[1].Voltage` | `INPUTVOLTAGE` / `set_input_voltage()` |
-| `output.voltage` | `UPS.PowerConverter.Output.Voltage` | `OUTPUTVOLTAGE` / `set_output_voltage()` |
+| `ups.load` | `UPS.PowerSummary.PercentLoad` | `LOAD` / `set_load()`; NUT 2.8.5+ |
+| `input.voltage` | `UPS.PowerConverter.Input.[1].Voltage` | `INPUTVOLTAGE` / `set_input_voltage()`; NUT 2.8.5+ |
+| `output.voltage` | `UPS.PowerConverter.Output.Voltage` | `OUTPUTVOLTAGE` / `set_output_voltage()`; NUT 2.8.5+ |
 | `ups.delay.start` | `UPS.PowerSummary.DelayBeforeStartup` | HID RW feature or `STARTDELAY` / `set_start_delay()` |
 | `ups.timer.start` | `UPS.PowerSummary.DelayBeforeStartup` | same HID field |
 | `ups.delay.shutdown` | `UPS.PowerSummary.DelayBeforeShutdown` | HID RW feature |
 | `ups.timer.shutdown` | `UPS.PowerSummary.DelayBeforeShutdown` | same HID field |
 | `ups.timer.reboot` | `UPS.PowerSummary.DelayBeforeReboot` | HID feature |
 
-The additional NUT fields are implemented in `HIDPowerDeviceNUT` so the original minimal HID UPS example does not gain the extra descriptor or report IDs.
+The additional NUT fields are implemented in `HIDPowerDeviceNUT`. They are inserted inside the original UPS HID application collection through a link-time extension hook, so the simulator presents one top-level UPS collection while the original minimal `examples/UPS` sketch remains unchanged.
 
 ## Status flags
 
@@ -85,13 +87,19 @@ with UpsSimulator.tcp("192.168.1.50") as ups:
 
 ## Verify with NUT
 
-After configuring the Arduino with `usbhid-ups`, query the exported variables from the NUT server:
+Check the installed NUT version first:
+
+```bash
+usbhid-ups -V
+```
+
+Then query the exported variables:
 
 ```bash
 upsc <ups-name>@localhost
 ```
 
-For the newly added fields, a normal reset state should include values similar to:
+On NUT 2.8.5+ a normal reset state should include values similar to:
 
 ```text
 ups.load: 25
@@ -100,6 +108,8 @@ output.voltage: 230.0
 ups.delay.start: -1
 ups.timer.start: -1
 ```
+
+On NUT 2.8.0-2.8.4 it is expected that `ups.load`, `input.voltage` and `output.voltage` are absent even though the simulator exposes the corresponding HID reports.
 
 The exact complete `upsc` list depends on the NUT version and what the HID driver accepts from the connected descriptor. Hardware-in-the-loop verification with `upsc` is therefore the final authority for the exported set.
 
