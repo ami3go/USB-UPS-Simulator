@@ -14,8 +14,7 @@
 #define DHCP_RESPONSE_TIMEOUT_MS 2000UL
 #define DHCP_MAINTAIN_INTERVAL_MS 1000UL
 #define DHCP_RETRY_INTERVAL_MS 60000UL
-#define ARM_DEFAULT_LEASE_SEC 120UL
-#define ARM_MAX_LEASE_SEC 3600UL
+#define ARM_LEASE_MS 120000UL
 
 HIDPowerDeviceNUT_ NutHidExtension;
 
@@ -91,7 +90,6 @@ unsigned long lastHeartbeatMs = 0;
 bool heartbeatState = false;
 bool dhcpLeased = false;
 unsigned long nextDhcpMaintainMs = 0;
-unsigned long armLeaseMs = 0;
 unsigned long lastCommandMs = 0;
 
 char netLine[96];
@@ -158,7 +156,6 @@ void setSafeState() {
   sim.runtimeAuto = true;
   sim.charging = OVERRIDE_AUTO;
   sim.lowBattery = OVERRIDE_AUTO;
-  armLeaseMs = 0;
   lastCommandMs = 0;
 
   iRemaining = 100;
@@ -340,7 +337,7 @@ void printIdent(Print &out) {
 }
 
 void printHelp(Print &out) {
-  out.println(F("OK commands: see docs/CONTROL_PROTOCOL.md"));
+  out.println(F("OK docs/CONTROL_PROTOCOL.md"));
 }
 
 bool requireArmed(Print &out) {
@@ -368,7 +365,6 @@ void handleCommand(char *line, Print &out) {
   char *save = NULL;
   char *command = strtok_r(line, " \t", &save);
   char *arg = strtok_r(NULL, " \t", &save);
-  char *arg2 = strtok_r(NULL, " \t", &save);
 
   if (sim.armed) lastCommandMs = millis();
 
@@ -403,13 +399,7 @@ void handleCommand(char *line, Print &out) {
       return;
     }
     if (value) {
-      unsigned long leaseSec = ARM_DEFAULT_LEASE_SEC;
-      if (arg2 && !parseUnsigned(arg2, 0, ARM_MAX_LEASE_SEC, leaseSec)) {
-        out.println(F("ERR range"));
-        return;
-      }
       sim.armed = true;
-      armLeaseMs = leaseSec * 1000UL;
       lastCommandMs = millis();
       out.println(F("OK armed"));
     } else {
@@ -543,11 +533,13 @@ void initEthernet() {
 }
 
 const uint8_t kReadOnlyFeatures[] PROGMEM = {
+  HID_PD_IPRODUCT, HID_PD_SERIAL, HID_PD_MANUFACTURER,
   HID_PD_PRESENTSTATUS, HID_PD_RUNTIMETOEMPTY, HID_PD_AVERAGETIME2FULL, HID_PD_AVERAGETIME2EMPTY,
   HID_PD_RECHARGEABLE, HID_PD_CAPACITYMODE, HID_PD_CONFIGVOLTAGE, HID_PD_VOLTAGE,
-  HID_PD_PERCENTLOAD, HID_PD_INPUTVOLTAGE, HID_PD_OUTPUTVOLTAGE, HID_PD_DESIGNCAPACITY,
-  HID_PD_FULLCHRGECAPACITY, HID_PD_REMAININGCAPACITY, HID_PD_CPCTYGRANULARITY1,
-  HID_PD_CPCTYGRANULARITY2, HID_PD_MANUFACTUREDATE
+  HID_PD_PERCENTLOAD, HID_PD_INPUTVOLTAGE, HID_PD_OUTPUTVOLTAGE, HID_PD_IDEVICECHEMISTRY,
+  HID_PD_IOEMINFORMATION, HID_PD_DESIGNCAPACITY, HID_PD_FULLCHRGECAPACITY,
+  HID_PD_REMAININGCAPACITY, HID_PD_CPCTYGRANULARITY1, HID_PD_CPCTYGRANULARITY2,
+  HID_PD_MANUFACTUREDATE
 };
 
 void setupHid() {
@@ -604,7 +596,7 @@ void setup() {
 void loop() {
   const unsigned long now = millis();
 
-  if (sim.armed && armLeaseMs && (unsigned long)(now - lastCommandMs) >= armLeaseMs) {
+  if (sim.armed && (unsigned long)(now - lastCommandMs) >= ARM_LEASE_MS) {
     setSafeState();
     updateModel();
     sendUsbReports(true);
