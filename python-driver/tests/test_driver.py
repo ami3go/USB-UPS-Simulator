@@ -1,6 +1,16 @@
+import contextlib
+import io
+import sys
+import types
 import unittest
 
-from ups_simulator import CommandError, UpsSimulator
+from ups_simulator import (
+    CommandError,
+    ProtocolError,
+    SerialLineTransport,
+    TransportError,
+    UpsSimulator,
+)
 
 
 STATUS = (
@@ -30,7 +40,7 @@ class FakeTransport:
         if command == "PING":
             return "OK PONG"
         if command == "IDENT?":
-            return "OK NutUPS Ethernet HID UPS Simulator v2"
+            return "OK NutUPS HID Simulator v2"
         if command == "STATUS?":
             return STATUS
         if command == "NETWORK?":
@@ -45,9 +55,13 @@ class DriverTests(unittest.TestCase):
         self.transport = FakeTransport()
         self.sim = UpsSimulator(self.transport)
 
+    def test_connect_checks_firmware_version(self):
+        self.assertIs(self.sim.connect(), self.sim)
+        self.assertEqual(self.transport.commands, ["IDENT?"])
+
     def test_ping_and_identify(self):
         self.assertTrue(self.sim.ping())
-        self.assertIn("NutUPS", self.sim.identify())
+        self.assertEqual(self.sim.identify(), "NutUPS HID Simulator v2")
 
     def test_status_is_parsed(self):
         status = self.sim.status()
@@ -74,7 +88,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(network.port, 5000)
 
     def test_high_level_commands(self):
-        self.sim.arm()
+        self.sim.arm(lease_seconds=45)
         self.sim.set_ac(False)
         self.sim.set_battery(25)
         self.sim.set_load(60)
@@ -94,7 +108,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(
             self.transport.commands,
             [
-                "ARM ON",
+                "ARM ON 45",
                 "AC OFF",
                 "BATTERY 25",
                 "LOAD 60",
@@ -127,6 +141,8 @@ class DriverTests(unittest.TestCase):
             self.sim.set_input_voltage(700.0)
         with self.assertRaises(ValueError):
             self.sim.set_start_delay(-2)
+        with self.assertRaises(ValueError):
+            self.sim.arm(lease_seconds=3601)
         self.assertEqual(self.transport.commands, [])
 
     def test_firmware_error_becomes_exception(self):
@@ -135,10 +151,96 @@ class DriverTests(unittest.TestCase):
 
     def test_armed_session_resets_after_exception(self):
         with self.assertRaises(RuntimeError):
-            with self.sim.armed_session():
+            with self.sim.armed_session(lease_seconds=60):
                 self.sim.set_ac(False)
                 raise RuntimeError("test failed")
-        self.assertEqual(self.transport.commands, ["ARM ON", "AC OFF", "RESET"])
+        self.assertEqual(self.transport.commands, ["ARM ON 60", "AC OFF", "RESET"])
+
+
+class FailingResetTransport(FakeTransport):
+    def command(self, command):
+        if command == "RESET":
+            raise TransportError("link lost")
+        return super().command(command)
+
+
+class NotPongTransport(FakeTransport):
+    def command(self, command):
+        if command == "PING":
+            return "OK NOT-PONG"
+        return super().command(command)
+
+
+class OldFirmwareTransport(FakeTransport):
+    def command(self, command):
+        if command == "IDENT?":
+            self.commands.append(command)
+            return "OK NutUPS HID Simulator v1"
+        return super().command(command)
+
+
+class FakeSerial:
+    """pyserial stand-in with a late boot banner still in flight."""
+
+    def __init__(self, *args, **kwargs):
+        self.rx = [b"NutUPS ready\r\n"]
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        command = data.strip()
+        if command == b"PING":
+            self.rx.append(b"OK PONG\r\n")
+        elif command == b"IDENT?":
+            self.rx.append(b"OK NutUPS HID Simulator v2\r\n")
+        else:
+            self.rx.append(b"OK\r\n")
+
+    def flush(self):
+        pass
+
+    def readline(self):
+        return self.rx.pop(0) if self.rx else b""
+
+    def close(self):
+        pass
+
+
+class RobustnessTests(unittest.TestCase):
+    def test_armed_session_keeps_original_error_when_cleanup_fails(self):
+        sim = UpsSimulator(FailingResetTransport())
+        with self.assertWarns(RuntimeWarning):
+            with self.assertRaises(ValueError):
+                with sim.armed_session():
+                    raise ValueError("test failed")
+
+    def test_cli_ping_failure_returns_nonzero(self):
+        from ups_simulator import cli
+
+        original = cli._make_client
+        cli._make_client = lambda args: UpsSimulator(NotPongTransport())
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(["--host", "sim", "ping"]), 1)
+        finally:
+            cli._make_client = original
+
+    def test_serial_transport_skips_boot_banner(self):
+        module = types.ModuleType("serial")
+        module.Serial = FakeSerial
+        sys.modules["serial"] = module
+        try:
+            transport = SerialLineTransport("/dev/ttyFAKE")
+            transport.connect()
+            self.assertEqual(transport.command("IDENT?"), "OK NutUPS HID Simulator v2")
+        finally:
+            del sys.modules["serial"]
+
+    def test_old_firmware_is_rejected_on_connect(self):
+        sim = UpsSimulator(OldFirmwareTransport())
+        with self.assertRaises(ProtocolError):
+            sim.connect()
 
 
 if __name__ == "__main__":
