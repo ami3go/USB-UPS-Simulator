@@ -36,6 +36,12 @@ UART extra:
 python -m pip install -e './python-driver[serial]'
 ```
 
+Hardware self-test extra:
+
+```bash
+python -m pip install -e './python-driver[selftest]'
+```
+
 The install provides:
 
 ```python
@@ -46,7 +52,33 @@ and:
 
 ```bash
 ups-sim
+ups-sim-selftest
 ```
+
+## Hardware self-test
+
+When the Leonardo USB cable is connected to the same PC that can reach the W5500 on the LAN, run:
+
+```bash
+ups-sim-selftest
+```
+
+The self-test:
+
+- detects the USB HID Power Device and the NUT extension report IDs when the OS exposes the report descriptor
+- discovers `NutUPS HID Simulator v2` on local TCP/5000
+- verifies the disarmed mutation guard
+- exercises every primary v2 command with `STATUS?` read-back checks
+- always attempts a final `RESET`
+- refuses OB/LB/shutdown-state tests if a live `upsmon` is detected, unless explicitly overridden
+
+If the IP is known, skip LAN discovery:
+
+```bash
+ups-sim-selftest --host 192.168.1.50
+```
+
+See [`docs/SELF_TEST.md`](../docs/SELF_TEST.md) for the complete guide and safety behavior.
 
 ## Connection behavior
 
@@ -341,6 +373,7 @@ Tests cover:
 - CLI ping failure exit status
 - cleanup failure without masking the original test exception
 - safe reset after exception
+- hardware self-test HID descriptor helpers and bounded network discovery logic
 
 The workflow runs for Python 3.9 and 3.13 and is also triggered by firmware/HID/protocol changes so host and firmware behavior cannot silently drift apart.
 
