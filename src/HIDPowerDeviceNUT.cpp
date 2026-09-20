@@ -1,4 +1,5 @@
 #include "HIDPowerDeviceNUT.h"
+#include "HIDPowerDevice.h"
 
 #if defined(_USING_HID)
 
@@ -68,5 +69,17 @@ const uint8_t hidPowerDeviceNutFragment[] PROGMEM = {
 };
 
 const uint16_t hidPowerDeviceNutFragmentSize = sizeof(hidPowerDeviceNutFragment);
+
+// Strong definition overrides the weak default in HIDPowerDevice.cpp when this
+// extension object file is linked.
+HIDSubDescriptor* HIDPowerDevice_extension() {
+    static HIDSubDescriptor node(hidPowerDeviceNutFragment, hidPowerDeviceNutFragmentSize);
+    return &node;
+}
+
+HIDPowerDeviceNUT_::HIDPowerDeviceNUT_() {
+    // Intentionally empty. Constructing this compatibility object makes the
+    // linker pull this object file, which provides HIDPowerDevice_extension().
+}
 
 #endif
