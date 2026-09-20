@@ -28,8 +28,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=2.0, help="I/O timeout in seconds")
 
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("ping", "identify", "status", "network", "arm", "disarm", "reset", "report"):
+    for name in ("ping", "identify", "status", "network", "disarm", "reset", "report"):
         commands.add_parser(name)
+
+    p = commands.add_parser("arm")
+    p.add_argument(
+        "--lease",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="arming lease, 0 disables timeout; firmware default is 120 seconds",
+    )
 
     p = commands.add_parser("ac")
     p.add_argument("state", type=_state, metavar="on|off")
@@ -82,7 +91,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with _make_client(args) as sim:
             cmd = args.command
             if cmd == "ping":
-                print("PONG" if sim.ping() else "unexpected response")
+                if not sim.ping():
+                    print("unexpected response", file=sys.stderr)
+                    return 1
+                print("PONG")
             elif cmd == "identify":
                 print(sim.identify())
             elif cmd == "status":
@@ -90,7 +102,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif cmd == "network":
                 print(json.dumps(asdict(sim.network_status()), indent=2))
             elif cmd == "arm":
-                sim.arm()
+                sim.arm(lease_seconds=args.lease)
                 print("armed")
             elif cmd == "disarm":
                 sim.disarm()
