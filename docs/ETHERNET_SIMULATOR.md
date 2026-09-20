@@ -48,17 +48,13 @@ See [HARDWARE.md](HARDWARE.md) for wiring and powering details.
 
 ## Powering for full shutdown tests
 
-If the simulated UPS causes the USB host to shut down, the controller must remain alive so it can later simulate restored power.
-
-Therefore, for full-cycle tests, power the Leonardo independently through a supported external-power input while keeping its USB cable connected to the NUT host.
+For shutdown/recovery testing, power the Leonardo independently through a supported external-power input while keeping USB connected to the NUT host. This keeps the W5500/controller alive after the host powers down so restored mains can be simulated later.
 
 Do not assume every clone implements power selection identically; verify the exact board specification before applying external and USB power simultaneously.
 
 ## Network behavior
 
-The firmware first attempts DHCP.
-
-If DHCP fails it falls back to:
+The firmware attempts DHCP with a bounded startup timeout. If DHCP fails it falls back to:
 
 ```text
 IP:      169.254.42.42
@@ -72,11 +68,13 @@ Default locally administered MAC:
 02:55:50:53:00:01
 ```
 
+DHCP maintenance is performed only when a real DHCP lease exists. Potentially blocking renew/rebind work is postponed while the simulator is armed so an active fault-injection session is not stalled by DHCP failure.
+
 Give each simulator a unique MAC address if multiple boards share one LAN.
 
 ## Safety model
 
-The simulator starts:
+The simulator starts in a known safe state:
 
 ```text
 DISARMED
@@ -88,27 +86,23 @@ output 230 V
 fault flags cleared
 ```
 
+The safe model is computed before Ethernet initialization, so a slow/failed DHCP attempt cannot leave USB HID `PresentStatus` at its zero-initialized on-battery/no-battery state.
+
 Read-only queries work while disarmed. State-changing commands require:
 
 ```text
 ARM ON
 ```
 
-Either:
+`ARM ON` uses a 120-second firmware-enforced lease. Every command received while armed refreshes that lease. An explicit lease is also supported:
 
 ```text
-RESET
+ARM ON 300
 ```
 
-or:
+Accepted range is `0..3600` seconds; `0` intentionally disables lease expiry. If a non-zero lease expires, the firmware restores the safe state and disarms even if the controlling process crashed or the network disappeared.
 
-```text
-ARM OFF
-```
-
-returns the simulator to the safe online state and disarms it.
-
-This behavior is deliberate because NUT can react to the generated `OB`, `LB`, overload, and shutdown-imminent states by shutting down real systems.
+Either `RESET` or `ARM OFF` immediately returns to the safe online state.
 
 ## Control channels
 
@@ -118,12 +112,21 @@ This behavior is deliberate because NUT can react to the generated `OB`, `LB`, o
 nc <simulator-ip> 5000
 ```
 
-A new connection prints:
+A new connection prints the identity and current arming state:
 
 ```text
 OK NutUPS HID Simulator v2
 OK DISARMED
 ```
+
+or, if an existing test is armed:
+
+```text
+OK NutUPS HID Simulator v2
+OK ARMED
+```
+
+The newest TCP connection replaces the previous controller. This prevents a stale/half-open W5500 socket from locking out recovery access.
 
 ### UART
 
@@ -139,14 +142,15 @@ IDENT?
 STATUS?
 NETWORK?
 HELP
+REPORT
 ```
 
 Safety/control:
 
 ```text
 ARM ON|OFF
+ARM ON 0..3600
 RESET
-REPORT
 ```
 
 State injection:
@@ -168,36 +172,26 @@ COMMLOST ON|OFF
 SHUTDOWN ON|OFF
 ```
 
-Voltage values are centivolts on the wire:
+Voltage values are centivolts on the wire (`1300` = 13.00 V, `23000` = 230.00 V). Use [CONTROL_PROTOCOL.md](CONTROL_PROTOCOL.md) for the full reference.
 
-```text
-1300  = 13.00 V
-23000 = 230.00 V
-```
+## USB/HID reliability hardening
 
-Use [CONTROL_PROTOCOL.md](CONTROL_PROTOCOL.md) for the full reference.
+The simulator now:
 
-## Dynamic model
+- publishes a coherent `PresentStatus` snapshot atomically
+- uses atomic access for 16-bit state shared with the USB interrupt
+- rejects host `SET_REPORT` writes to simulator-owned read-only Feature reports
+- avoids heap allocation in USB Feature receive handling
+- checks HID interrupt endpoint space before sending reports
+- sends `PresentStatus` first
+- only marks an interrupt-report batch delivered if the whole batch was queued; otherwise it retries on the next loop
+- keeps the NUT descriptor extension inside the original top-level UPS Application collection
 
-### Runtime
-
-`RUNTIME AUTO` scales runtime according to battery charge and the configured full-runtime reference.
-
-### Charging
-
-`CHARGING AUTO` reports charging when AC is present and battery charge is below 100%.
-
-### Low battery
-
-`LOWBAT AUTO` becomes active at or below the default 5% remaining-capacity limit.
-
-### Remaining-time limit
-
-The default low-runtime threshold is 600 seconds. While discharging, runtime at or below this threshold sets the remaining-time-limit-expired condition and contributes to shutdown-imminent behavior.
+These changes are important on the ATmega32U4 because 16-bit accesses are not atomic and the Arduino USB interrupt endpoint can otherwise block report sending.
 
 ## NUT-facing measurements
 
-The simulator exposes the base HIDPowerDevice fields plus the NUT extension:
+The simulator exposes the base HIDPowerDevice fields plus the NUT extension, including:
 
 ```text
 battery.charge
@@ -217,114 +211,51 @@ ups.timer.reboot
 ups.status
 ```
 
-See [NUT_VARIABLES.md](NUT_VARIABLES.md) for exact HID paths.
-
-## Example outage
-
-```text
-ARM ON
-AC OFF
-BATTERY 70
-LOAD 55
-STATUS?
-```
-
-The NUT host should observe on-battery/discharging state.
-
-## Example low battery
-
-```text
-ARM ON
-AC OFF
-BATTERY 4
-RUNTIME 300
-STATUS?
-```
-
-This activates low-battery state and places runtime below the default 600-second remaining-time limit.
-
-## Example voltage/load simulation
-
-```text
-ARM ON
-LOAD 80
-INPUTVOLTAGE 21500
-OUTPUTVOLTAGE 22950
-STATUS?
-```
-
-NUT should report approximately:
-
-```text
-ups.load: 80
-input.voltage: 215.0
-output.voltage: 229.5
-```
-
-## Example restoration
-
-```text
-AC ON
-BATTERY 45
-RUNTIME AUTO
-LOWBAT AUTO
-CHARGING AUTO
-OVERLOAD OFF
-REPLACE OFF
-COMMLOST OFF
-SHUTDOWN OFF
-STATUS?
-```
-
-Finish with:
-
-```text
-RESET
-```
+`ups.load`, `input.voltage`, and `output.voltage` require **NUT 2.8.5+**. See [NUT_VARIABLES.md](NUT_VARIABLES.md) for exact HID paths and version details.
 
 ## Python control
 
-The preferred automation layer is the repository's Python driver:
+The preferred automation layer is the repository's Python driver. It synchronizes TCP/UART framing with `PING`, checks the v2 firmware identity on connect, and provides `armed_session()` cleanup plus the firmware arming lease.
 
 ```python
 from ups_simulator import UpsSimulator
 
 with UpsSimulator.tcp("192.168.1.50") as ups:
-    with ups.armed_session():
+    with ups.armed_session(lease_seconds=120):
         ups.set_ac(False)
         ups.set_battery(40)
         ups.set_load(65)
-        ups.set_input_voltage(228.5)
-        ups.set_output_voltage(230.1)
         print(ups.status())
 ```
-
-`armed_session()` resets the simulator on exit, including exception paths.
 
 See [the Python driver manual](../python-driver/README.md).
 
 ## Security
 
-The W5500 control protocol has no authentication or encryption. Do not expose TCP/5000 to an untrusted network.
+The W5500 control protocol has no authentication or encryption. The arming gate and lease are safety controls, not access controls.
 
-`ARM ON` protects against accidental mutation; it is not an authentication mechanism.
+Use a direct control link, dedicated management/test VLAN, or firewall rules that restrict TCP/5000 to authorized controllers. Authentication only in Python/Cockpit cannot protect the raw Arduino port from another host that can connect directly.
 
 ## Current Leonardo resource use
 
-Reference CI build with Arduino AVR core 1.8.8 and Ethernet library 2.0.2:
+Reference CI build is pinned to Arduino AVR core 1.8.8 and Ethernet library 2.0.2 and compiles with warnings enabled.
 
 ```text
 Original UPS example:
-  flash  9,818 / 28,672 bytes (34%)
-  RAM      302 / 2,560 bytes (11%)
+  flash 10,176 / 28,672 bytes (35%)
+  RAM      330 / 2,560 bytes (12%)
 
 Ethernet/NUT simulator:
-  flash 28,070 / 28,672 bytes (97%)
-  RAM    1,296 / 2,560 bytes (50%)
+  flash 27,854 / 28,672 bytes (97%)
+  RAM    1,321 / 2,560 bytes (51%)
 ```
 
-Only about 602 bytes of flash headroom remain. Treat the AVR firmware as effectively feature-frozen. Put scenario engines, web/Cockpit UI, persistent configuration, authentication, logs, and orchestration in the Linux/Python side.
+The simulator has **818 bytes of flash headroom**. CI enforces a maximum of 28,160 bytes so at least 512 bytes remain available for reliability fixes.
+
+Keep feature growth on the Linux/Python/Cockpit side unless firmware participation is essential to USB HID behavior. Scenario engines, web UI, persistence, rich logging and orchestration do not belong on this AVR target.
 
 ## Known limitation: communication loss
 
 `COMMLOST ON` sets the HID `CommunicationLost` flag, but it does not physically detach USB. It therefore does not guarantee a NUT driver-level `NOCOMM` event. Real USB transport-loss testing needs a separate mechanism.
+
+The HID delay Feature values are also stored values, not yet a complete countdown/output-power model; realistic delayed output-off/start behavior remains a future feature.
