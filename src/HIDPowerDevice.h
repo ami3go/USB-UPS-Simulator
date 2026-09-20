@@ -105,20 +105,19 @@ public:
   void begin(void);
 
   void setOutput(Serial_&);
-
   void setSerial(const char*);
-
   void end(void);
 
   int sendDate(uint16_t id, uint16_t year, uint8_t month, uint8_t day);
   int sendReport(uint16_t id, const void* bval, int len);
-
   int setFeature(uint16_t id, const void* data, int len);
-
   int setStringFeature(uint8_t id, const uint8_t* index, const char* data);
 };
 
 extern HIDPowerDevice_ PowerDevice;
+
+// Optional descriptor items inserted inside the main UPS application collection.
+HIDSubDescriptor* HIDPowerDevice_extension();
 
 #endif
 #endif
