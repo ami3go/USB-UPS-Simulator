@@ -19,6 +19,12 @@
 
 #include "HID.h"
 
+#ifndef ISERIAL_MAX_LEN
+#define ISERIAL_MAX_LEN 20
+#endif
+
+#define HID_FEATURE_RX_MAX 9
+
 #if defined(USBCON)
 
 HID_& HID()
@@ -29,7 +35,7 @@ HID_& HID()
 
 int HID_::getInterface(uint8_t* interfaceCount)
 {
-    *interfaceCount += 1; // uses 1
+    *interfaceCount += 1;
     HIDDescriptor hidInterface = {
         D_INTERFACE(pluggedInterface, 2, USB_DEVICE_CLASS_HUMAN_INTERFACE, HID_SUBCLASS_NONE, HID_PROTOCOL_NONE),
         D_HIDREPORT(descriptorSize),
@@ -39,7 +45,6 @@ int HID_::getInterface(uint8_t* interfaceCount)
     return USB_SendControl(0, &hidInterface, sizeof(hidInterface));
 }
 
-// Since this function is not exposed in USBCore API, had to replicate here.
 static bool USB_SendStringDescriptor(const char* string_P, u8 string_len, uint8_t flags) {
     u8 c[2] = {(u8)(2 + string_len * 2), 3};
 
@@ -61,9 +66,7 @@ int HID_::getDescriptor(USBSetup& setup)
 {
     u8 t = setup.wValueH;
 
-    // HID-specific strings
     if(USB_STRING_DESCRIPTOR_TYPE == t) {
-        // we place all strings in the 0xFF00-0xFFFE range
         HIDReport* rep = GetFeature(0xFF00 | setup.wValueL );
         if(rep) {
             return USB_SendStringDescriptor((char*)rep->data, strlen_P((char*)rep->data), TRANSFER_PGM);
@@ -73,11 +76,8 @@ int HID_::getDescriptor(USBSetup& setup)
         }
     }
 
-    // Check if this is a HID Class Descriptor request
     if (setup.bmRequestType != REQUEST_DEVICETOHOST_STANDARD_INTERFACE) { return 0; }
     if (HID_REPORT_DESCRIPTOR_TYPE != t) { return 0; }
-
-    // In a HID Class Descriptor wIndex cointains the interface number
     if (setup.wIndex != pluggedInterface) { return 0; }
 
     int total = 0;
@@ -89,8 +89,6 @@ int HID_::getDescriptor(USBSetup& setup)
         total += res;
     }
 
-    // Reset the protocol on reenumeration. Normally the host should not assume the state of the protocol
-    // due to the USB specs, but Windows and Linux just assumes its in report mode.
     protocol = HID_REPORT_PROTOCOL;
 
     return total;
@@ -99,13 +97,11 @@ int HID_::getDescriptor(USBSetup& setup)
 uint8_t HID_::getShortName(char *name)
 {
     if(serial) {
-        for(byte i=0; i<strlen_P(serial); i++) {
-            name[i] = pgm_read_byte_near(serial + i);
-        }
-        return strlen_P(serial);
+        uint8_t len = strnlen_P(serial, ISERIAL_MAX_LEN - 1);
+        memcpy_P(name, serial, len);
+        return len;
     }
     else {
-        // default serial number
         name[0] = 'H';
         name[1] = 'I';
         name[2] = 'D';
@@ -135,12 +131,11 @@ int HID_::SetFeature(uint16_t id, const void* data, int len)
         rootReport = new HIDReport(id, data, len);
     } else {
         HIDReport* current;
-        int i=0;
-        for ( current = rootReport; current; current = current->next, i++) {
+        uint16_t i=0;
+        for (current = rootReport; current; current = current->next, i++) {
             if(current->id == id) {
                 return i;
             }
-            // check if we are on the last report
             if(!current->next) {
                 current->next = new HIDReport(id, data, len);
                 break;
@@ -155,7 +150,7 @@ int HID_::SetFeature(uint16_t id, const void* data, int len)
 bool HID_::LockFeature(uint16_t id, bool lock) {
     if(rootReport) {
         HIDReport* current;
-        for(current = rootReport;current; current=current->next) {
+        for(current = rootReport; current; current=current->next) {
             if(current->id == id) {
                 current->lock = lock;
                 return true;
@@ -164,7 +159,6 @@ bool HID_::LockFeature(uint16_t id, bool lock) {
     }
     return false;
 }
-
 
 int HID_::SendReport(uint16_t id, const void* data, int len)
 {
@@ -178,7 +172,7 @@ int HID_::SendReport(uint16_t id, const void* data, int len)
 HIDReport* HID_::GetFeature(uint16_t id)
 {
     HIDReport* current;
-    int i=0;
+    uint16_t i=0;
     for(current=rootReport; current && i<reportCount; current=current->next, i++) {
         if(id == current->id) {
             return current;
@@ -213,19 +207,15 @@ bool HID_::setup(USBSetup& setup)
             return true;
         }
         if (request == HID_GET_PROTOCOL) {
-            // TODO: Send8(protocol);
             return true;
         }
         if (request == HID_GET_IDLE) {
-            // TODO: Send8(idle);
         }
     }
 
     if (requestType == REQUEST_HOSTTODEVICE_CLASS_INTERFACE)
     {
         if (request == HID_SET_PROTOCOL) {
-            // The USB Host tells us if we are in boot or report mode.
-            // This only works with a real boot compatible device.
             protocol = setup.wValueL;
             return true;
         }
@@ -237,15 +227,14 @@ bool HID_::setup(USBSetup& setup)
         {
             if(setup.wValueH == HID_REPORT_TYPE_FEATURE)
             {
-
                 HIDReport* current = GetFeature(setup.wValueL);
-                if(!current) return false;
-                if(setup.wLength != current->length + 1) return false;
-                uint8_t* data = new uint8_t[setup.wLength];
+                if(!current || current->lock) return false;
+
+                uint8_t data[HID_FEATURE_RX_MAX];
+                if(setup.wLength != current->length + 1 || setup.wLength > sizeof(data)) return false;
                 USB_RecvControl(data, setup.wLength);
-                if(*data != current->id) return false;
-                memcpy((uint8_t*)current->data, data+1, current->length);
-                delete[] data;
+                if(data[0] != current->id) return false;
+                memcpy((uint8_t*)current->data, data + 1, current->length);
                 return true;
             }
         }
@@ -256,10 +245,12 @@ bool HID_::setup(USBSetup& setup)
 
 HID_::HID_(void) : PluggableUSBModule(2, 1, epType),
                    rootNode(NULL), descriptorSize(0),
-                   protocol(HID_REPORT_PROTOCOL), idle(1)
+                   protocol(HID_REPORT_PROTOCOL), idle(1),
+                   rootReport(NULL), reportCount(0),
+                   dbg(NULL), serial(NULL)
 {
     epType[0] = EP_TYPE_INTERRUPT_IN;
-        epType[1] = EP_TYPE_INTERRUPT_OUT;
+    epType[1] = EP_TYPE_INTERRUPT_OUT;
     PluggableUSB().plug(this);
 }
 
