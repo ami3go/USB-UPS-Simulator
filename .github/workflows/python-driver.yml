@@ -4,10 +4,16 @@ on:
   push:
     paths:
       - 'python-driver/**'
+      - 'examples/UPS_Simulator_Ethernet/**'
+      - 'src/**'
+      - 'docs/CONTROL_PROTOCOL.md'
       - '.github/workflows/python-driver.yml'
   pull_request:
     paths:
       - 'python-driver/**'
+      - 'examples/UPS_Simulator_Ethernet/**'
+      - 'src/**'
+      - 'docs/CONTROL_PROTOCOL.md'
       - '.github/workflows/python-driver.yml'
 
 jobs:
