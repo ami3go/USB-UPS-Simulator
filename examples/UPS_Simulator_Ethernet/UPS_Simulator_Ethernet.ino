@@ -17,9 +17,7 @@
 #define ARM_DEFAULT_LEASE_SEC 120UL
 #define ARM_MAX_LEASE_SEC 3600UL
 
-// DelayBeforeStartup, PercentLoad and input/output voltage are inserted into
-// the single UPS application collection created by HIDPowerDevice.
-HIDPOWERDEVICE_ENABLE_NUT_EXTENSION()
+HIDPowerDeviceNUT_ NutHidExtension;
 
 byte macAddress[] = { 0x02, 0x55, 0x50, 0x53, 0x00, 0x01 };
 IPAddress fallbackIp(169, 254, 42, 42);
@@ -294,9 +292,6 @@ void sendUsbReports(bool force) {
   if (sent) sent = usbSend(HID_PD_INPUTVOLTAGE, &inputVoltage, sizeof(inputVoltage));
   if (sent) sent = usbSend(HID_PD_OUTPUTVOLTAGE, &outputVoltage, sizeof(outputVoltage));
 
-  // Only acknowledge a report cycle when every report was queued. If the USB
-  // endpoint was full, leave the previous snapshot untouched so the next loop
-  // retries immediately instead of waiting for the periodic refresh.
   if (sent) {
     iPreviousStatus = status;
     iPrevRemaining = iRemaining;
@@ -615,8 +610,6 @@ void loop() {
     sendUsbReports(true);
   }
 
-  // DHCP maintenance can block during a failed renew. Never risk that while a
-  // fault-injection session is armed; postpone it until the simulator is safe.
   if (!sim.armed && dhcpLeased && (long)(now - nextDhcpMaintainMs) >= 0) {
     const int rc = Ethernet.maintain();
     nextDhcpMaintainMs = millis() +
