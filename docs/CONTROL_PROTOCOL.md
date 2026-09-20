@@ -15,7 +15,8 @@ Ethernet is the recommended control channel. UART exists for bench testing and r
 - CRLF is accepted
 - commands are case-insensitive
 - maximum firmware input line buffer is 96 bytes
-- TCP firmware serves one active control client at a time
+- one TCP control client is active at a time
+- a newly accepted TCP client replaces the previous client, which recovers from stale/half-open sessions
 
 A TCP connection starts with two lines:
 
@@ -23,6 +24,14 @@ A TCP connection starts with two lines:
 OK NutUPS HID Simulator v2
 OK DISARMED
 ```
+
+If the simulator is already armed when a new controller connects, the second line is:
+
+```text
+OK ARMED
+```
+
+The Python driver does not depend on greeting timing. It sends `PING` while connecting and consumes all lines up to `OK PONG`, so it also remains compatible with older firmware that emitted the greeting only after receiving the first command.
 
 ## Response format
 
@@ -50,15 +59,27 @@ ERR line
 
 The firmware intentionally keeps error strings short to fit the Leonardo flash limit. Client software should treat the `ERR` prefix as the authoritative failure indicator.
 
-## Safety model
+## Safety model and arming lease
 
-After boot the simulator is disarmed. Read-only commands work immediately, but state-changing commands are rejected until:
+After boot the simulator is disarmed. Read-only commands work immediately, but state-changing commands are rejected until it is armed.
+
+The preferred form is:
 
 ```text
 ARM ON
 ```
 
-To restore a safe state:
+`ARM ON` uses the firmware default **120-second lease**. Every command received while armed refreshes the lease timer. If no command arrives before the lease expires, the firmware automatically restores the safe online state and disarms itself.
+
+An explicit lease may be selected:
+
+```text
+ARM ON 300
+```
+
+Accepted lease range is `0..3600` seconds. `0` explicitly disables automatic lease expiry and should only be used for controlled bench work where an indefinite armed state is intentional.
+
+To restore a safe state immediately:
 
 ```text
 RESET
@@ -72,24 +93,27 @@ ARM OFF
 
 Both restore safe defaults and leave the simulator disarmed.
 
+The lease is enforced by the firmware, so it still works if the Python controller is killed, loses power, or loses the network connection.
+
 ## Read-only commands
 
 | Command | Response / purpose |
 |---|---|
-| `PING` | Returns `OK PONG`. |
+| `PING` | Returns `OK PONG`; while armed it also refreshes the arming lease. |
 | `IDENT?` | Returns simulator identity/version. |
 | `STATUS?` | Returns current state as space-separated `key=value` fields. `STATUS` is also accepted. |
 | `NETWORK?` | Returns local IP, gateway, subnet, and TCP port. |
 | `HELP` | Returns a compact pointer to documentation. `?` is also accepted. |
+| `REPORT` | Forces an immediate USB HID report refresh. Allowed while disarmed. |
 
 ## Safety/control commands
 
 | Command | Range | Meaning |
 |---|---:|---|
-| `ARM ON` | - | Permit state-changing commands. |
+| `ARM ON` | default 120 s | Permit state-changing commands with the default lease. |
+| `ARM ON n` | `0..3600` seconds | Arm with an explicit lease; `0` disables lease expiry. |
 | `ARM OFF` | - | Reset to safe state and disarm. |
 | `RESET` | - | Reset to safe state and disarm. |
-| `REPORT` | - | Force an immediate USB HID report refresh. |
 
 ## Simulated state commands
 
@@ -161,6 +185,19 @@ low battery becomes active when battery charge is at or below the configured rem
 
 The current remaining-time threshold is 600 seconds. While discharging, runtime at or below this threshold asserts the remaining-time-limit-expired condition and contributes to shutdown-imminent behavior.
 
+### Arm lease expiry
+
+If the simulator is armed with a non-zero lease and receives no command before that lease expires, it performs the equivalent of a safe reset:
+
+- disarms
+- AC present
+- battery 100%
+- runtime automatic
+- clears overload, replacement, communication-loss and shutdown flags
+- restores default load and voltages
+
+This is intentionally a firmware-level fail-safe rather than a Python-only cleanup mechanism.
+
 ## `STATUS?` fields
 
 Example:
@@ -228,7 +265,7 @@ STATUS?
 ### Low battery / short runtime
 
 ```text
-ARM ON
+ARM ON 120
 AC OFF
 BATTERY 4
 RUNTIME 300
@@ -280,4 +317,12 @@ RESET
 
 ## Security
 
-TCP/5000 has no authentication or encryption. Keep it on a trusted test/management network or restrict access externally. `ARM ON` is not an access-control mechanism.
+TCP/5000 has no authentication or encryption. `ARM ON` and the arming lease are **safety controls, not access controls**.
+
+Use one of these deployment patterns for the control interface:
+
+- a direct point-to-point Ethernet connection to the test controller
+- a dedicated test/management VLAN with firewall rules limiting TCP/5000 to authorized controller hosts
+- another physically or logically isolated trusted lab network
+
+Authentication implemented only in Python or Cockpit cannot protect the raw Arduino TCP port because another host could bypass that software and connect directly to TCP/5000.
