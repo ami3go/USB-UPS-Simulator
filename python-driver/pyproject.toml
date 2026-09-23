@@ -22,6 +22,7 @@ selftest = ["psutil>=5.9", "pyusb>=1.2"]
 [project.scripts]
 ups-sim = "ups_simulator.cli:main"
 ups-sim-selftest = "ups_simulator.selftest:main"
+ups-sim-firmware-sim = "ups_simulator.firmware_sim:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
