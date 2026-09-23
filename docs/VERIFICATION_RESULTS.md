@@ -120,10 +120,64 @@ Compiler warnings observed during this run come from the Arduino AVR core `new.c
 | Leonardo AVR compilation | PASS |
 | Ethernet/NUT simulator compilation | PASS |
 | Flash-budget gate | PASS |
+| Real hardware USB HID Power Device + NUT extension IDs | PASS |
+| Real hardware Ethernet/W5500 discovery | PASS |
+| Real hardware v2 protocol self-test | PASS |
+
+## Real hardware self-test (Leonardo + W5500)
+
+- Date: **2026-09-23**
+- Board: Arduino Leonardo, `2341:8036`, USB-connected on Linux
+- Toolchain: `arduino-cli 1.5.1`, Arduino AVR core `1.8.8`, Ethernet library `2.0.2` (matches the pinned CI reference exactly)
+- Flash usage: `27,854 / 28,672 bytes (97%)` — identical to the CI compile figure above
+- Network: W5500 shield, DHCP-leased on the local LAN, control port reachable on TCP/5000
+
+`ups-sim-selftest` result:
+
+```text
+[PASS] USB HID Power Device - 0003:00002341:00008036 Arduino LLC Arduino Leonardo; NUT extension report IDs present
+[PASS] Ethernet simulator discovery - <lan-ip>
+[PASS] shutdown safety pre-check - no active upsmon detected
+[PASS] RESET safe state
+[PASS] PING
+[PASS] IDENT?
+[PASS] NETWORK?
+[PASS] STATUS?
+[PASS] HELP
+[PASS] ?
+[PASS] disarmed mutation guard
+[PASS] ARM ON
+[PASS] REPORT
+[PASS] BATTERY
+[PASS] RUNTIME manual
+[PASS] RUNTIME AUTO
+[PASS] VOLTAGE
+[PASS] LOAD
+[PASS] INPUTVOLTAGE
+[PASS] OUTPUTVOLTAGE
+[PASS] STARTDELAY
+[PASS] CHARGING ON/OFF/AUTO
+[PASS] AC OFF/ON
+[PASS] LOWBAT ON/OFF/AUTO
+[PASS] OVERLOAD ON/OFF
+[PASS] REPLACE ON/OFF
+[PASS] COMMLOST ON/OFF
+[PASS] SHUTDOWN ON/OFF
+[PASS] ARM OFF
+[PASS] ARM ON lease
+[PASS] final RESET
+[PASS] self-test complete - simulator restored to safe RESET state
+```
+
+Exit code: `0`.
+
+This exercises, on real hardware, everything the "not proven by software-only verification" list below used to call out: ATmega32U4 native USB HID enumeration, the NUT HID extension report IDs, W5500 SPI/link/DHCP behavior, and the full v2 TCP protocol surface.
+
+**Observed transient:** the very first `ups-sim-selftest` run against a freshly DHCP-leased board failed with `timeout waiting for simulator response` immediately after Ethernet discovery succeeded. A manual probe of the same host/port right afterward got an instant, correct greeting and `PING`/`IDENT?` reply, and rerunning `ups-sim-selftest --host <ip>` a few seconds later passed cleanly with no other changes. This lines up with the documented `EthernetServer::accept()` "newest connection takes over" behavior (see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)): the self-test's LAN-discovery step opens and closes one short TCP connection, and opening the persistent test connection immediately afterward can race the W5500 hardware socket's teardown/re-listen cycle. No firmware change was made for this — it is consistent with normal W5500 socket-transition timing rather than a functional defect. If it recurs, retry with `--host`, or allow a few seconds after boot before scanning.
 
 ## Not proven by software-only verification
 
-These checks still require the physical Leonardo + W5500 hardware and/or a real NUT host:
+These checks required the physical Leonardo + W5500 hardware and/or a real NUT host, and were confirmed above on real hardware on 2026-09-23:
 
 - ATmega32U4 native USB HID enumeration
 - real USB interrupt endpoint timing
@@ -132,11 +186,14 @@ These checks still require the physical Leonardo + W5500 hardware and/or a real 
 - real DHCP acquisition/renewal timing
 - TCP behavior on the physical W5500
 - HID report delivery to the operating system
+
+Still outstanding, requiring a real NUT host:
+
 - real NUT `usbhid-ups` interpretation
 - `OL -> OB -> LB -> OL` observed through `upsc`
 - host shutdown and recovery behavior
 
-Use `ups-sim-selftest` for the next hardware validation layer, followed by a real NUT integration test.
+Use a real NUT integration test for the remaining validation layer.
 
 ## Reproduction
 

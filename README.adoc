@@ -99,6 +99,40 @@ arduino-cli upload \
 
 See link:docs/FLASHING.md[FLASHING.md] for Arduino IDE and bootloader-recovery procedures.
 
+=== Linux notes: installing arduino-cli and serial permissions
+
+If `arduino-cli` is not already installed, the official installer drops a binary into a directory you choose -- no system package or root needed:
+
+[source,shell]
+----
+mkdir -p ~/bin
+curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=~/bin sh
+export PATH="$HOME/bin:$PATH"   # add this line to ~/.bashrc or ~/.zshrc to persist it
+----
+
+On Linux, `/dev/ttyACM*` is normally owned by `root:dialout` with group-only read/write access. If `arduino-cli upload` fails with:
+
+[source,text]
+----
+OS error: cannot open port /dev/ttyACM0: Permission denied
+----
+
+add your user to the `dialout` group once:
+
+[source,shell]
+----
+sudo usermod -aG dialout "$USER"
+----
+
+Group membership is only picked up by *new* login sessions, so fully log out and back in (or reboot) afterward -- opening a new terminal window inside the same session is not enough. If you cannot log out right away, `sg` runs a single command with `dialout` active immediately:
+
+[source,shell]
+----
+sg dialout -c "arduino-cli upload --fqbn arduino:avr:leonardo -p /dev/ttyACM0 examples/UPS_Simulator_Ethernet"
+----
+
+Uploading to a Leonardo triggers a USB bootloader touch (1200-baud reset), so the port briefly disappears and re-enumerates as a fresh device node. Because of that, a one-off `sudo chmod 666 /dev/ttyACM0` gets silently undone mid-upload -- the `dialout` group membership (or `sg dialout` per command) is the fix that survives the re-enumeration, not a manual `chmod`.
+
 === 4. Connect
 
 DHCP is attempted first. Fallback:
