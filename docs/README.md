@@ -8,6 +8,7 @@ This directory contains the complete user and developer documentation for the Ar
 |---|---|
 | [Quick start and flashing](FLASHING.md) | Assemble the hardware, install Arduino tools, build, flash, and run the first simulator test. |
 | [Hardware self-test](SELF_TEST.md) | Detect the USB HID UPS and Ethernet simulator from one PC, then verify the complete v2 command set safely. |
+| [Firmware behavior simulator](FIRMWARE_SIMULATOR.md) | Run the v2 command parser/state model without hardware and verify exact responses, state transitions, and arming-lease behavior. |
 | [Hardware guide](HARDWARE.md) | Leonardo/W5500 compatibility, pin usage, USB/UART/Ethernet wiring, and power recommendations. |
 | [Control protocol](CONTROL_PROTOCOL.md) | Complete TCP/UART command reference, status fields, units, responses, and test sequences. |
 | [Python driver manual](../python-driver/README.md) | Install and use the `ups_simulator` Python API and `ups-sim` CLI. |
